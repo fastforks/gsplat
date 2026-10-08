@@ -387,6 +387,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
                     alphas.data_ptr<float>(),
                     last_ids.data_ptr<int32_t>()
                 );
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
         };
 
         // NOTE: Here we need to support tile_size=4 temporarily, because test_basic.py

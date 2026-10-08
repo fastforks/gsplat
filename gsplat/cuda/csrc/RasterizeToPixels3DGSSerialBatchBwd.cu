@@ -299,8 +299,13 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
                     buffer[k] += rgbs_batch[t * CDIM + k] * fac;
                 }
             }
+            bool reduced = false;
+            // The reduce-scatter needs full 32-lane warps; tile_size=4 launches
+            // 16-thread blocks and takes the per-component path below.
             if constexpr(CDIM + 8 <= 16)
+            if(block.size() % 32 == 0)
             {
+                reduced = true;
                 // Reduce all gradient components at once; lane 2k ends up
                 // holding component k and issues its atomic in parallel.
                 // Layout: rgb[CDIM], conic[3], xy[2], xy_abs[2], opacity.
@@ -344,7 +349,7 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
                         atomicAdd_system(ptr, sum);
                 }
             }
-            else
+            if(!reduced)
             {
                 warpSum<CDIM>(v_rgb_local, warp);
                 warpSum(v_conic_local, warp);

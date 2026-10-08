@@ -24,6 +24,7 @@ struct GeomAdamParam
     const float *g2; // optional second gradient contribution, added to g
     const float *act; // activation output for the chain rule (nullptr: identity)
     float beta1, beta2, eps, step_size, bc2_sqrt;
+    bool skip; // no gradient this step: torch.optim.Adam skips the parameter
 };
 
 enum GeomAct
@@ -35,6 +36,10 @@ enum GeomAct
 
 __device__ __forceinline__ void geom_adam_elem(const GeomAdamParam &q, const int64_t i, const int act)
 {
+    if(q.skip)
+    {
+        return;
+    }
     float grad = 0.f;
     if(q.g != nullptr || q.g2 != nullptr)
     {
@@ -121,7 +126,7 @@ static GeomAdamParam make_param(
         g2.has_value() ? g2.value().const_data_ptr<float>() : nullptr,
         act.has_value() ? act.value().const_data_ptr<float>() : nullptr,
         static_cast<float>(beta1), static_cast<float>(beta2), static_cast<float>(eps),
-        static_cast<float>(step_size), static_cast<float>(bc2_sqrt)};
+        static_cast<float>(step_size), static_cast<float>(bc2_sqrt), !g.has_value() && !g2.has_value()};
 }
 
 // hp_* = [beta1, beta2, eps, step_size (lr / bias_correction1), bias_correction2_sqrt]

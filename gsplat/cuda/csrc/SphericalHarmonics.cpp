@@ -1165,6 +1165,7 @@ at::Tensor sh_colors_fused_fwd(
     TORCH_CHECK(sh0.scalar_type() == at::kFloat && shN.scalar_type() == at::kFloat, "fused SH colors require fp32");
     TORCH_CHECK(sh0.dim() == 3 && sh0.size(1) == 1 && sh0.size(0) == means.size(0), "sh0 must be [N, 1, D]");
     TORCH_CHECK(shN.dim() == 3 && shN.size(0) == means.size(0) && shN.size(2) == sh0.size(2), "shN must be [N, K, D]");
+    TORCH_CHECK(sh0.size(2) <= 4, "fused SH colors support up to 4 channels");
     const at::Tensor vm = viewmats.contiguous();
     auto colors         = at::empty({vm.numel() / 16, means.size(0), sh0.size(2)}, means.options());
     launch_sh_colors_fused_fwd_kernel(degrees_to_use, means, vm, sh0, shN, colors);
@@ -1322,8 +1323,16 @@ at::optional<at::Tensor> sh_colors_lazy_bwd_adam(
     CHECK_INPUT(shN_v);
     CHECK_INPUT(last);
     CHECK_INPUT(tabs);
-    TORCH_CHECK(step < tabs.size(1), "tabs too short");
+    TORCH_CHECK(tabs.dim() == 2 && tabs.size(0) == 4 && step < tabs.size(1), "tabs must be [4, T] with T > step");
+    TORCH_CHECK(shN.scalar_type() == at::kFloat && sh0.scalar_type() == at::kFloat, "lazy SH requires fp32");
+    TORCH_CHECK(shN.dim() == 3 && shN.size(-1) <= 4, "shN must be [N, K, D] with D <= 4");
+    TORCH_CHECK(sh0.dim() == 3 && sh0.size(0) == shN.size(0) && sh0.size(1) == 1 && sh0.size(2) == shN.size(2), "sh0 must be [N, 1, D]");
+    TORCH_CHECK(sh0_m.sizes() == sh0.sizes() && sh0_v.sizes() == sh0.sizes(), "sh0 Adam state shape");
+    TORCH_CHECK(shN_m.sizes() == shN.sizes() && shN_v.sizes() == shN.sizes(), "shN Adam state shape");
+    TORCH_CHECK(last.scalar_type() == at::kInt && last.numel() == shN.size(0), "last must be int32 [N]");
+    TORCH_CHECK(means.dim() == 2 && means.size(0) == shN.size(0), "means must be [N, 3]");
     at::Tensor grad_colors = v_colors.contiguous();
+    TORCH_CHECK(grad_colors.numel() == viewmats.numel() / 16 * shN.size(0) * shN.size(2), "v_colors must be [C, N, D]");
     at::Tensor v_means;
     if(compute_v_means)
     {
@@ -1357,6 +1366,7 @@ void sh_lazy_catchup(
     CHECK_INPUT(last);
     TORCH_CHECK(step_size_tab.is_contiguous() && bc2_sqrt_tab.is_contiguous(), "tables must be contiguous");
     TORCH_CHECK(last.numel() == p.size(0), "last must be [N]");
+    TORCH_CHECK(step < step_size_tab.numel() && step < bc2_sqrt_tab.numel(), "Adam step tables too short");
     launch_sh_lazy_catchup_kernel(
         p, m, v, last, static_cast<int>(step), step_size_tab, bc2_sqrt_tab, static_cast<float>(beta1),
         static_cast<float>(beta2), static_cast<float>(eps)
