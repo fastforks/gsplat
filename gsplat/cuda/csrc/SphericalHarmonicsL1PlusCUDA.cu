@@ -720,19 +720,25 @@ __global__ void spherical_harmonics_l1_plus_bwd_kernel(
         const int64_t camera_id    = packed ? camera_ids[output_id] : dense_image_id % C;
         const int64_t gaussian_id  = packed ? gaussian_ids[output_id] : coeff_id;
         const int64_t image_offset = batch_id * C + camera_id;
-        const float *mean          = means + (batch_id * N + gaussian_id) * 3;
-        const vec3 dir             = view_direction_from_camera_data(mean, viewmats, camera_offsets, image_offset);
         vec3 v_dir                 = {0.f, 0.f, 0.f};
-        sh_l1_plus_coeffs_to_color_fast_vjp<scalar_t>(
-            DEGREE,
-            D,
-            c,
-            dir,
-            coeffs_ptr,
-            v_colors + output_id * D,
-            acc.data(),
-            v_means == nullptr && v_viewdirs == nullptr ? nullptr : &v_dir
-        );
+        // Every term of this channel's VJP is scaled by its color gradient. It is
+        // exactly zero for gaussians not visible in this image, so skip reading
+        // the mean and the SH coefficients for them.
+        if(v_colors[output_id * D + c] != opmath_t(0))
+        {
+            const float *mean = means + (batch_id * N + gaussian_id) * 3;
+            const vec3 dir    = view_direction_from_camera_data(mean, viewmats, camera_offsets, image_offset);
+            sh_l1_plus_coeffs_to_color_fast_vjp<scalar_t>(
+                DEGREE,
+                D,
+                c,
+                dir,
+                coeffs_ptr,
+                v_colors + output_id * D,
+                acc.data(),
+                v_means == nullptr && v_viewdirs == nullptr ? nullptr : &v_dir
+            );
+        }
 
         // Adjacent threads handle channels of the same coefficient row. Combine
         // their direction gradients before touching the geometry outputs.
