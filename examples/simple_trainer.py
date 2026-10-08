@@ -59,6 +59,7 @@ from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization, RasterizeMode
+from gsplat.optimizers.fused_sh_adam import spherical_harmonics_l1_plus_fused_adam
 
 try:
     from gsplat.scene import GaussianScene
@@ -168,6 +169,10 @@ class Config:
     # Evaluate SH from sh0 and shN separately instead of concatenating them
     # into one [N, K, 3] tensor every step (avoids the cat and its backward copies).
     split_sh: bool = False
+    # With split_sh: apply shN's Adam step inside the SH backward kernel instead of
+    # materializing its gradient (exact; saves memory traffic). Requires the
+    # default torch Adam optimizer.
+    fused_shn_adam: bool = False
     # Turn on another SH degree every this steps
     sh_degree_interval: int = 1000
     # Initial opacity of GS
@@ -395,6 +400,9 @@ class Runner:
         set_random_seed(42 + local_rank)
 
         self.cfg = cfg
+        if cfg.fused_shn_adam:
+            assert cfg.split_sh and not cfg.sh_fp16 and not cfg.app_opt, "fused_shn_adam requires split_sh"
+            assert not cfg.visible_adam and not cfg.sparse_grad, "fused_shn_adam requires torch Adam"
         self.world_rank = world_rank
         self.local_rank = local_rank
         self.world_size = world_size
@@ -692,13 +700,18 @@ class Runner:
         elif self.cfg.split_sh and not self.cfg.sh_fp16:
             sh_degree = kwargs.pop("sh_degree", self.cfg.sh_degree)
             colors = spherical_harmonics_l0(splats["sh0"])  # [N, 3]
-            if sh_degree > 0:
-                colors = colors + spherical_harmonics_l1_plus(
-                    sh_degree,
-                    means,
-                    torch.linalg.inv_ex(camtoworlds).inverse,
-                    splats["shN"],
-                )  # [C, N, 3]
+            # Evaluate l>=1 even at degree 0: like the concatenated path, shN then
+            # gets an (all-zero) gradient and its Adam step count keeps advancing.
+            viewmats = torch.linalg.inv_ex(camtoworlds).inverse
+            if self.cfg.fused_shn_adam and torch.is_grad_enabled():
+                shN_colors = spherical_harmonics_l1_plus_fused_adam(
+                    sh_degree, means, viewmats, splats["shN"], self.optimizers["shN"]
+                )
+            else:
+                shN_colors = spherical_harmonics_l1_plus(
+                    sh_degree, means, viewmats, splats["shN"]
+                )
+            colors = colors + shN_colors  # [C, N, 3]
             colors = torch.clamp_min(colors + 0.5, 0.0)
             colors = colors.expand(camtoworlds.shape[0], -1, -1)  # [C, N, 3]
         else:
