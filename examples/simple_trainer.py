@@ -406,6 +406,28 @@ def create_splats_with_optimizers(
     return splats, optimizers
 
 
+class _DeviceCachedLoader:
+    """Iterates shuffled batches like DataLoader(shuffle=True, drop_last=False)
+    over dataset items that are all kept on `device`."""
+
+    def __init__(self, dataset, batch_size: int, device):
+        items = [dataset[i] for i in range(len(dataset))]
+        self.n = len(items)
+        self.batch_size = batch_size
+        self.data = {
+            k: [torch.as_tensor(item[k]).to(device) for item in items] for k in items[0]
+        }
+
+    def __iter__(self):
+        order = torch.randperm(self.n).tolist()
+        for i in range(0, self.n, self.batch_size):
+            idx = order[i : i + self.batch_size]
+            if len(idx) == 1:
+                yield {k: v[idx[0]].unsqueeze(0) for k, v in self.data.items()}
+            else:
+                yield {k: torch.stack([v[j] for j in idx]) for k, v in self.data.items()}
+
+
 class Runner:
     """Engine for training and testing."""
 
@@ -929,14 +951,20 @@ class Runner:
         if cfg.cache_images:
             # before the loader starts its workers, which then share the cache
             self.trainset.preload_images()
-        trainloader = torch.utils.data.DataLoader(
-            self.trainset,
-            batch_size=cfg.batch_size,
-            shuffle=True,
-            num_workers=cfg.num_workers,
-            persistent_workers=True,
-            pin_memory=True,
-        )
+        if cfg.cache_images and cfg.num_workers == 0:
+            # Keep the decoded training set on the GPU: no worker processes, no
+            # per-step IPC / pinning (which also contend for the GIL with the
+            # training loop) and no host-to-device copies.
+            trainloader = _DeviceCachedLoader(self.trainset, cfg.batch_size, device)
+        else:
+            trainloader = torch.utils.data.DataLoader(
+                self.trainset,
+                batch_size=cfg.batch_size,
+                shuffle=True,
+                num_workers=cfg.num_workers,
+                persistent_workers=cfg.num_workers > 0,
+                pin_memory=True,
+            )
         trainloader_iter = iter(trainloader)
 
         # Training loop.
