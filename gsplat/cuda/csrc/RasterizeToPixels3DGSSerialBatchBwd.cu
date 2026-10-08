@@ -488,8 +488,10 @@ __global__ void __launch_bounds__(256 / PPT, 8) rasterize_to_pixels_3dgs_bwd_ppt
     const int64_t num_batches       = (num_intersections + BLOCK - 1) / BLOCK;
 
     __shared__ int32_t id_batch[BLOCK];
-    __shared__ vec3 xy_opacity_batch[BLOCK];
-    __shared__ vec3 conic_batch[BLOCK];
+    // Per-gaussian data packed for wide shared-memory loads:
+    // pk0 = (x, y, opacity, conic.x), pk1 = (conic.y, conic.z, rgb0, rgb1).
+    __shared__ float4 pk0_batch[BLOCK];
+    __shared__ float4 pk1_batch[BLOCK];
     __shared__ float rgbs_batch[BLOCK * CDIM];
 
     float bg_dot[PPT];
@@ -517,25 +519,34 @@ __global__ void __launch_bounds__(256 / PPT, 8) rasterize_to_pixels_3dgs_bwd_ppt
         const int64_t idx              = range_start + batch_end_offset - tr;
         if(idx >= range_start)
         {
-            const int32_t g      = flatten_ids[idx];
-            id_batch[tr]         = g;
-            const vec2 xy        = means2d[g];
-            xy_opacity_batch[tr] = {xy.x, xy.y, opacities[g]};
-            conic_batch[tr]      = conics[g];
+            const int32_t g = flatten_ids[idx];
+            id_batch[tr]    = g;
+            const vec2 xy   = means2d[g];
+            const vec3 cn   = conics[g];
 #    pragma unroll
             for(uint32_t k = 0; k < CDIM; ++k)
             {
                 rgbs_batch[tr * CDIM + k] = colors[g * CDIM + k];
             }
+            pk0_batch[tr] = make_float4(xy.x, xy.y, opacities[g], cn.x);
+            pk1_batch[tr] = make_float4(cn.y, cn.z, colors[g * CDIM], CDIM > 1 ? colors[g * CDIM + 1] : 0.f);
         }
         block.sync();
         const int64_t first_t64 = batch_end_offset > warp_bin_final ? batch_end_offset - warp_bin_final : 0;
         const uint32_t first_t  = first_t64 < batch_size ? static_cast<uint32_t>(first_t64) : batch_size;
         for(uint32_t t = first_t; t < batch_size; ++t)
         {
-            const vec3 conic   = conic_batch[t];
-            const vec3 xy_opac = xy_opacity_batch[t];
+            const float4 a0    = pk0_batch[t];
+            const float4 a1    = pk1_batch[t];
+            const vec3 conic   = {a0.w, a1.x, a1.y};
+            const vec3 xy_opac = {a0.x, a0.y, a0.z};
             const float opac   = xy_opac.z;
+            float rgb_t[CDIM];
+#    pragma unroll
+            for(uint32_t k = 0; k < CDIM; ++k)
+            {
+                rgb_t[k] = k == 0 ? a1.z : (k == 1 ? a1.w : rgbs_batch[t * CDIM + k]);
+            }
             bool valid[PPT];
             float alpha[PPT], vis[PPT];
             vec2 delta[PPT];
@@ -579,7 +590,7 @@ __global__ void __launch_bounds__(256 / PPT, 8) rasterize_to_pixels_3dgs_bwd_ppt
                 for(uint32_t k = 0; k < CDIM; ++k)
                 {
                     vals[k] += fac * v_render_c[p][k];
-                    v_alpha += (rgbs_batch[t * CDIM + k] * T[p] - buffer[p][k] * ra) * v_render_c[p][k];
+                    v_alpha += (rgb_t[k] * T[p] - buffer[p][k] * ra) * v_render_c[p][k];
                 }
                 v_alpha += T_final[p] * ra * v_render_a[p];
                 if(backgrounds != nullptr)
@@ -604,7 +615,7 @@ __global__ void __launch_bounds__(256 / PPT, 8) rasterize_to_pixels_3dgs_bwd_ppt
 #    pragma unroll
                 for(uint32_t k = 0; k < CDIM; ++k)
                 {
-                    buffer[p][k] += rgbs_batch[t * CDIM + k] * fac;
+                    buffer[p][k] += rgb_t[k] * fac;
                 }
             }
             const float sum  = warpReduceScatter16(vals, lane);
