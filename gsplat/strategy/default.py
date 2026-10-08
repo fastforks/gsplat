@@ -265,11 +265,22 @@ class DefaultStrategy(Strategy):
             gs_ids = info["gaussian_ids"]  # [nnz]
             radii = info["radii"].max(dim=-1).values  # [nnz]
         else:
-            # grads is [C, N, 2]
+            # grads is [C, N, 2]. Dense masked updates instead of boolean
+            # indexing: same values, but no data-dependent shapes, so no
+            # host-device sync every step.
             sel = (info["radii"] > 0.0).all(dim=-1)  # [C, N]
-            gs_ids = torch.where(sel)[1]  # [nnz]
-            grads = grads[sel]  # [nnz, 2]
-            radii = info["radii"][sel].max(dim=-1).values  # [nnz]
+            zero = grads.new_zeros(())
+            state["grad2d"] += torch.where(sel, grads.norm(dim=-1), zero).sum(dim=0)
+            state["count"] += sel.sum(dim=0, dtype=torch.float32)
+            if self.refine_scale2d_stop_iter > 0:
+                # normalize radii to [0, 1] screen space; state["radii"] >= 0
+                radii = info["radii"].max(dim=-1).values / float(
+                    max(info["width"], info["height"])
+                )
+                state["radii"] = torch.maximum(
+                    state["radii"], torch.where(sel, radii, zero).amax(dim=0)
+                )
+            return
         state["grad2d"].index_add_(0, gs_ids, grads.norm(dim=-1))
         state["count"].index_add_(
             0, gs_ids, torch.ones_like(gs_ids, dtype=torch.float32)
