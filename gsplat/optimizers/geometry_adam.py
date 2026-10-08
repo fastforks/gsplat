@@ -25,6 +25,15 @@ class GeometryAdam:
 
     def __init__(self, optimizers: Dict[str, torch.optim.Adam]):
         self.opts = [optimizers[n] for n in self.NAMES]
+        # Extra means gradient handed over by another backward (e.g. LazySHAdam)
+        # instead of going through autograd's accumulation; added in-kernel.
+        self.extra_means_grad = None
+
+    def add_means_grad(self, g: Tensor):
+        if self.extra_means_grad is None:
+            self.extra_means_grad = g
+        else:
+            self.extra_means_grad = self.extra_means_grad + g
 
     def _state(self, opt):
         (group,) = opt.param_groups
@@ -54,6 +63,9 @@ class GeometryAdam:
         for opt, g, act in zip(self.opts, (g_means, g_quats, g_scales, g_opac), (None, None, scales_act, opac_act)):
             group, p, state = self._state(opt)
             args += [p.data, state["exp_avg"], state["exp_avg_sq"], None if g is None else g.contiguous()]
+            if opt is self.opts[0]:
+                extra, self.extra_means_grad = self.extra_means_grad, None
+                args.append(None if extra is None else extra.contiguous())
             if act is not None:
                 args.append(act)
             args.append(self._hp(group, state))

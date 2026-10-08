@@ -586,6 +586,8 @@ class Runner:
             else None
         )
         self.geo_adam = GeometryAdam(self.optimizers) if cfg.fused_geometry_adam else None
+        if self.lazy_sh is not None and self.geo_adam is not None:
+            self.lazy_sh.means_grad_sink = self.geo_adam
         self.splats = self.scene.splats
         self.stage = Stage()
         self.stage.add_scene(self.scene, self.rasterize_splats)

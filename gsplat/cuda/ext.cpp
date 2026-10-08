@@ -1025,7 +1025,7 @@ TORCH_LIBRARY(gsplat, m)
         "strategy_update_state(Tensor grads, Tensor radii, float sx, float sy, Tensor(a!) grad2d, Tensor(b!) count) -> ()"
     );
     m.def(
-        "geometry_adam(Tensor(a!) means, Tensor(b!) means_m, Tensor(c!) means_v, Tensor? g_means, float[] hp_means, "
+        "geometry_adam(Tensor(a!) means, Tensor(b!) means_m, Tensor(c!) means_v, Tensor? g_means, Tensor? g2_means, float[] hp_means, "
         "Tensor(d!) quats, Tensor(e!) quats_m, Tensor(f!) quats_v, Tensor? g_quats, float[] hp_quats, "
         "Tensor(g!) scales, Tensor(h!) scales_m, Tensor(i!) scales_v, Tensor? g_scales, Tensor scales_act, float[] hp_scales, "
         "Tensor(j!) opac, Tensor(k!) opac_m, Tensor(l!) opac_v, Tensor? g_opac, Tensor opac_act, float[] hp_opac) -> ()"
