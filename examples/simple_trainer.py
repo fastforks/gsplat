@@ -760,9 +760,9 @@ class Runner:
         if raw_geometry:
             # means/quats/scales/opacities are the raw parameters; activation,
             # projection and their backward + Adam are fused (GeometryAdam.project).
-            means, opacities, radii, means2d, depths, conics = self.geo_adam.project(
+            means, opacities, radii, means2d, depths, conics, tiles_per_gauss = self.geo_adam.project(
                 means, quats, scales, opacities, viewmats, Ks, width, height,
-                eps2d=0.3, near_plane=near_plane, far_plane=far_plane,
+                eps2d=0.3, near_plane=near_plane, far_plane=far_plane, tile_size=tile_size,
             )
         else:
             radii, means2d, depths, conics, _ = fully_fused_projection(
@@ -775,10 +775,16 @@ class Runner:
         opac = opacities[None] if C == 1 else opacities[None].expand(C, N)
         tile_width = math.ceil(width / float(tile_size))
         tile_height = math.ceil(height / float(tile_size))
-        _, isect_ids, flatten_ids = isect_tiles(
-            means2d, radii, depths, tile_size, tile_width, tile_height,
-            packed=False, n_images=C, conics=conics, opacities=opac,
-        )
+        if raw_geometry:
+            # first pass (tiles per gaussian) already done in the projection
+            isect_ids, flatten_ids = torch.ops.gsplat.intersect_tile_counted(
+                means2d, radii, depths, conics, opac, tiles_per_gauss, tile_size, tile_width, tile_height
+            )
+        else:
+            _, isect_ids, flatten_ids = isect_tiles(
+                means2d, radii, depths, tile_size, tile_width, tile_height,
+                packed=False, n_images=C, conics=conics, opacities=opac,
+            )
         isect_offsets = isect_offset_encode(isect_ids, C, tile_width, tile_height)
         render_colors, render_alphas = rasterize_to_pixels(
             means2d, conics, colors, opac, width, height, tile_size, isect_offsets, flatten_ids,

@@ -1040,8 +1040,12 @@ TORCH_LIBRARY(gsplat, m)
     );
     m.def(
         "projection_act_fwd(Tensor means, Tensor quats, Tensor log_scales, Tensor logits, Tensor viewmats, "
-        "Tensor Ks, int image_width, int image_height, float eps2d, float near_plane, float far_plane) "
-        "-> (Tensor, Tensor, Tensor, Tensor, Tensor)"
+        "Tensor Ks, int image_width, int image_height, float eps2d, float near_plane, float far_plane, "
+        "int tile_size, int tile_width, int tile_height) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
+    );
+    m.def(
+        "intersect_tile_counted(Tensor means2d, Tensor radii, Tensor depths, Tensor conics, Tensor opacities, "
+        "Tensor tiles_per_gauss, int tile_size, int tile_width, int tile_height) -> (Tensor, Tensor)"
     );
     m.def("sh_colors_fused_fwd(int degrees_to_use, Tensor means, Tensor viewmats, Tensor sh0, Tensor shN) -> Tensor");
     m.def(

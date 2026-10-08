@@ -59,16 +59,17 @@ class GeometryAdam:
         return _GeomActivate.apply(self, means, quats, log_scales, opacity_logits)
 
     def project(self, means, quats, log_scales, opacity_logits, viewmats, Ks, width, height,
-                eps2d=0.3, near_plane=0.01, far_plane=1e10):
+                eps2d=0.3, near_plane=0.01, far_plane=1e10, tile_size=16):
         """``activate`` followed by ``fully_fused_projection`` (one camera, pinhole,
         dense, no compensation), with the projection backward fused into the
-        Adam kernel. Returns ``(means, opacities, radii, means2d, depths, conics)``;
+        Adam kernel. Returns ``(means, opacities, radii, means2d, depths, conics,
+        tiles_per_gauss)``; the last is intersect_tile's first pass for ``tile_size``;
         ``means`` / ``opacities`` are the (activated) tensors for the other
         consumers, whose gradients are added as in ``activate``."""
         assert torch.is_grad_enabled() and viewmats.shape[0] == 1 and means.dim() == 2
         return _ProjectGeomAdam.apply(
             self, means, quats, log_scales, opacity_logits, viewmats.contiguous(), Ks.contiguous(),
-            width, height, eps2d, near_plane, far_plane,
+            width, height, eps2d, near_plane, far_plane, tile_size,
         )
 
     def _hps(self, has_grads):
@@ -133,20 +134,22 @@ class _GeomActivate(torch.autograd.Function):
 class _ProjectGeomAdam(torch.autograd.Function):
     @staticmethod
     def forward(ctx, mgr, means, quats, log_scales, opacity_logits, viewmats, Ks, width, height, eps2d,
-                near_plane, far_plane):
+                near_plane, far_plane, tile_size):
         # exp / sigmoid are applied inside the projection (and recomputed in
         # the backward), matching torch.exp / torch.sigmoid bit for bit.
-        radii, means2d, depths, conics, opac = _make_lazy_cuda_func("projection_act_fwd")(
+        tile_w, tile_h = math.ceil(width / tile_size), math.ceil(height / tile_size)
+        radii, means2d, depths, conics, opac, tiles = _make_lazy_cuda_func("projection_act_fwd")(
             means, quats, log_scales, opacity_logits, viewmats, Ks, width, height, eps2d, near_plane, far_plane,
+            tile_size, tile_w, tile_h,
         )
         ctx.mgr, ctx.width, ctx.height = mgr, width, height
         ctx.set_materialize_grads(False)
-        ctx.mark_non_differentiable(radii)
+        ctx.mark_non_differentiable(radii, tiles)
         ctx.save_for_backward(viewmats, Ks, radii, conics)
-        return means.view_as(means), opac, radii, means2d, depths, conics
+        return means.view_as(means), opac, radii, means2d, depths, conics, tiles
 
     @staticmethod
-    def backward(ctx, g_means, g_opac, _g_radii, v_means2d, v_depths, v_conics):
+    def backward(ctx, g_means, g_opac, _g_radii, v_means2d, v_depths, v_conics, _g_tiles):
         viewmats, Ks, radii, conics = ctx.saved_tensors
         if v_means2d is None:
             v_means2d = torch.zeros_like(radii, dtype=conics.dtype)
@@ -154,4 +157,4 @@ class _ProjectGeomAdam(torch.autograd.Function):
             v_conics = torch.zeros_like(conics)
         ctx.mgr.step_projection(g_means, g_opac, viewmats, Ks, ctx.width, ctx.height,
                                 radii, conics, v_means2d, v_depths, v_conics)
-        return (None,) * 12
+        return (None,) * 13
