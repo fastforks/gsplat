@@ -37,6 +37,9 @@ namespace gsplat
 using SupportedChannels = dispatch::IntParam<GSPLAT_NUM_CHANNELS>;
 
 namespace cg = cooperative_groups;
+#    ifndef BWD_PPT
+#        define BWD_PPT 2
+#    endif
 
 template<uint32_t CDIM, typename scalar_t>
 __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
@@ -419,7 +422,7 @@ __global__ void rasterize_to_pixels_3dgs_bwd_ppt_kernel(
 {
     static_assert(CDIM + 8 <= 16, "reduce-scatter path needs CDIM + 8 <= 16");
     constexpr uint32_t TILE = 16, BLOCK = TILE * TILE / PPT;
-    static_assert(PPT == 2, "patch mapping below assumes PPT == 2 (8x8 patch per warp)");
+    static_assert(PPT == 2 || PPT == 4, "patch mapping supports PPT 2 (8x8 per warp) or 4 (8x16 per warp)");
     auto block                 = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     const uint32_t linear_block_index = blockIdx.x;
@@ -446,9 +449,9 @@ __global__ void rasterize_to_pixels_3dgs_bwd_ppt_kernel(
     }
 
     const uint32_t tr   = block.thread_rank();
-    const uint32_t lane = tr % 32, w = tr / 32; // 4 warps -> 2x2 patches of 8x8
+    const uint32_t lane = tr % 32, w = tr / 32; // warps tile the 16x16 tile in 8 x (4 * PPT) patches
     const uint32_t lx   = (w % 2) * 8 + lane % 8;
-    const uint32_t ly0  = (w / 2) * 8 + lane / 8; // pixel p at row ly0 + 4 * p
+    const uint32_t ly0  = (w / 2) * (4 * PPT) + lane / 8; // pixel p at row ly0 + 4 * p
 
     float px[PPT], py[PPT], T_final[PPT], T[PPT], buffer[PPT][CDIM], v_render_c[PPT][CDIM], v_render_a[PPT];
     int32_t bin_final[PPT];
@@ -692,8 +695,8 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
         {
             if(tile_size == 16)
             {
-                rasterize_to_pixels_3dgs_bwd_ppt_kernel<CDIM, 2>
-                    <<<n_tiles, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+                rasterize_to_pixels_3dgs_bwd_ppt_kernel<CDIM, BWD_PPT>
+                    <<<n_tiles, 256 / BWD_PPT, 0, at::cuda::getCurrentCUDAStream()>>>(
                         I,
                         n_isects,
                         reinterpret_cast<const vec2 *>(means2d.const_data_ptr<float>()),
