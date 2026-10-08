@@ -15,6 +15,7 @@
 
 #include "Common.h"
 #include "Utils.cuh"
+#include "AccuTile.cuh"
 
 namespace gsplat
 {
@@ -368,7 +369,11 @@ __global__ void projection_act_fwd_kernel(
     float *__restrict__ means2d,  // [N, 2]
     float *__restrict__ depths,   // [N]
     float *__restrict__ conics,   // [N, 3]
-    float *__restrict__ opac_out  // [N]
+    float *__restrict__ opac_out, // [N]
+    const uint32_t tile_size,
+    const uint32_t tile_width,
+    const uint32_t tile_height,
+    int32_t *__restrict__ tiles_per_gauss // [N] AccuTile count (intersect_tile's first pass)
 )
 {
     const int64_t gid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -378,6 +383,7 @@ __global__ void projection_act_fwd_kernel(
     }
     const float opacity = act_sigmoid(logits[gid]);
     opac_out[gid]       = opacity;
+    tiles_per_gauss[gid] = 0; // overwritten below for visible gaussians
 
     mat3 R = mat3(
         viewmat[0], viewmat[4], viewmat[8], // 1st column
@@ -443,14 +449,34 @@ __global__ void projection_act_fwd_kernel(
     conics[gid * 3]      = covar2d_inv[0][0];
     conics[gid * 3 + 1]  = covar2d_inv[0][1];
     conics[gid * 3 + 2]  = covar2d_inv[1][1];
+
+    // Tile count exactly as intersect_tile_kernel's first pass (dense, one
+    // image, AccuTile path) computes it from the values just written.
+    if((int32_t)radius_x <= 0 || (int32_t)radius_y <= 0)
+    {
+        return;
+    }
+    const float A = covar2d_inv[0][0], B = covar2d_inv[0][1], C = covar2d_inv[1][1];
+    const float2 m2d       = {mean2d.x, mean2d.y};
+    const AccuTileSetup su = accutile_setup(A, B, C, opacity, m2d, tile_size, tile_width, tile_height);
+    if(su.empty)
+    {
+        return;
+    }
+    int64_t unused = 0;
+    tiles_per_gauss[gid] = static_cast<int32_t>(accutile_process_tiles(
+        A, B, C, su.disc, su.t, m2d, su.bbox_min, su.bbox_max, su.bbox_argmin, su.bbox_argmax, su.rect_min,
+        su.rect_max, tile_size, tile_width, tile_width * tile_height, su.isY, 0, 0,
+        static_cast<int64_t>(tile_width) * tile_height, 0, 0, 0, 0, nullptr, nullptr, &unused
+    ));
 }
 
 // Returns radii [1, N, 2], means2d [1, N, 2], depths [1, N], conics [1, N, 3],
 // opacities [N] (sigmoid of the logits).
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> projection_act_fwd(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> projection_act_fwd(
     const at::Tensor &means, const at::Tensor &quats, const at::Tensor &log_scales, const at::Tensor &logits,
     const at::Tensor &viewmats, const at::Tensor &Ks, int64_t image_width, int64_t image_height, double eps2d,
-    double near_plane, double far_plane
+    double near_plane, double far_plane, int64_t tile_size, int64_t tile_width, int64_t tile_height
 )
 {
     DEVICE_GUARD(means);
@@ -469,6 +495,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> projectio
     at::Tensor depths = at::empty({1, N}, opt);
     at::Tensor conics = at::empty({1, N, 3}, opt);
     at::Tensor opac   = at::empty({N}, opt);
+    at::Tensor tiles  = at::empty({1, N}, opt.dtype(at::kInt));
     if(N > 0)
     {
         constexpr unsigned threads = 256;
@@ -477,11 +504,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> projectio
             logits.const_data_ptr<float>(), viewmats.const_data_ptr<float>(), Ks.const_data_ptr<float>(),
             static_cast<uint32_t>(image_width), static_cast<uint32_t>(image_height), static_cast<float>(eps2d),
             static_cast<float>(near_plane), static_cast<float>(far_plane), radii.data_ptr<int32_t>(),
-            m2d.data_ptr<float>(), depths.data_ptr<float>(), conics.data_ptr<float>(), opac.data_ptr<float>()
+            m2d.data_ptr<float>(), depths.data_ptr<float>(), conics.data_ptr<float>(), opac.data_ptr<float>(),
+            static_cast<uint32_t>(tile_size), static_cast<uint32_t>(tile_width), static_cast<uint32_t>(tile_height),
+            tiles.data_ptr<int32_t>()
         );
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
-    return {radii, m2d, depths, conics, opac};
+    return {radii, m2d, depths, conics, opac, tiles};
 }
 
 TORCH_LIBRARY_IMPL(gsplat, CUDA, m)

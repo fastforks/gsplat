@@ -805,8 +805,60 @@ at::Tensor intersect_offset_privateuseone(
     return offsets;
 }
 
+// intersect_tile for one dense image when the first pass (tiles per gaussian)
+// was already computed (projection_act_fwd); second pass + sort unchanged.
+std::tuple<at::Tensor, at::Tensor> intersect_tile_counted(
+    const at::Tensor &means2d,        // [1, N, 2]
+    const at::Tensor &radii,          // [1, N, 2]
+    const at::Tensor &depths,         // [1, N]
+    const at::Tensor &conics,         // [1, N, 3]
+    const at::Tensor &opacities,      // [1, N]
+    const at::Tensor &tiles_per_gauss, // [1, N] int32
+    int64_t tile_size,
+    int64_t tile_width,
+    int64_t tile_height
+)
+{
+    DEVICE_GUARD(means2d);
+    TORCH_CHECK(means2d.dim() == 3 && means2d.size(0) == 1, "intersect_tile_counted expects [1, N, 2] means2d");
+    const int64_t N = means2d.size(1);
+    for(auto t: {means2d, radii, depths, conics, opacities, tiles_per_gauss})
+    {
+        CHECK_INPUT(t);
+    }
+    TORCH_CHECK(tiles_per_gauss.scalar_type() == at::kInt && tiles_per_gauss.numel() == N, "tiles_per_gauss must be int32 [1, N]");
+    TORCH_CHECK(opacities.numel() == N && conics.numel() == 3 * N && radii.numel() == 2 * N && depths.numel() == N,
+                "intersect_tile_counted: inconsistent shapes");
+    auto opt                    = depths.options();
+    const uint32_t image_n_bits = bits_for_count(1);
+    const uint32_t tile_n_bits  = bits_for_count(tile_width * tile_height);
+    TORCH_CHECK(image_n_bits + tile_n_bits <= 32, "intersect_tile_counted: too many tiles");
+    int64_t n_isects = 0;
+    at::Tensor cum_tiles_per_gauss;
+    if(N > 0)
+    {
+        cum_tiles_per_gauss = at::cumsum(tiles_per_gauss.view({-1}), 0, at::kLong);
+        n_isects            = cum_tiles_per_gauss[-1].item<int64_t>();
+    }
+    at::Tensor isect_ids   = at::empty({n_isects}, opt.dtype(at::kLong));
+    at::Tensor flatten_ids = at::empty({n_isects}, opt.dtype(at::kInt));
+    if(n_isects == 0)
+    {
+        return {isect_ids, flatten_ids};
+    }
+    launch_intersect_tile_kernel(
+        means2d, radii, depths, conics, opacities, c10::nullopt, c10::nullopt, 1, tile_size, tile_width, tile_height,
+        cum_tiles_per_gauss, c10::nullopt, at::optional<at::Tensor>(isect_ids), at::optional<at::Tensor>(flatten_ids)
+    );
+    at::Tensor isect_ids_sorted   = at::empty_like(isect_ids);
+    at::Tensor flatten_ids_sorted = at::empty_like(flatten_ids);
+    radix_sort_double_buffer(n_isects, image_n_bits, tile_n_bits, isect_ids, flatten_ids, isect_ids_sorted, flatten_ids_sorted);
+    return {isect_ids_sorted, flatten_ids_sorted};
+}
+
 void register_intersect_cuda_impl(torch::Library &m)
 {
+    m.impl("intersect_tile_counted", &intersect_tile_counted);
     m.impl("intersect_tile", to_torch_op<&intersect_tile>);
     m.impl("intersect_tile_lidar", to_torch_op<&intersect_tile_lidar>);
     m.impl("intersect_offset", to_torch_op<&intersect_offset>);
