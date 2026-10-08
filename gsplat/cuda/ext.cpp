@@ -1007,6 +1007,11 @@ TORCH_LIBRARY(gsplat, m)
         "Tensor? batch_ids, Tensor? camera_ids, Tensor? gaussian_ids, Tensor? viewmats_rs=None) -> Tensor"
     );
     m.def(
+        "spherical_harmonics_l1_plus_bwd_adam(int degrees_to_use, Tensor means, Tensor viewmats, Tensor(a!) shN, "
+        "Tensor v_colors, Tensor(b!) exp_avg, Tensor(c!) exp_avg_sq, float step_size, float beta1, float beta2, "
+        "float eps, float bias_correction2_sqrt, bool compute_v_means) -> Tensor?"
+    );
+    m.def(
         "spherical_harmonics_l1_plus_bwd(int degrees_to_use, Tensor means, Tensor viewmats, Tensor shN, Tensor? "
         "masks, Tensor? batch_ids, Tensor? camera_ids, Tensor? gaussian_ids, Tensor? viewmats_rs, Tensor v_colors, "
         "bool compute_v_means, bool compute_v_viewmats, bool compute_v_viewmats_rs) -> (Tensor, Tensor?, Tensor?, "
