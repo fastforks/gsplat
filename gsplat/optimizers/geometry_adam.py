@@ -63,12 +63,16 @@ class GeometryAdam:
         for opt, g, act in zip(self.opts, (g_means, g_quats, g_scales, g_opac), (None, None, scales_act, opac_act)):
             group, p, state = self._state(opt)
             args += [p.data, state["exp_avg"], state["exp_avg_sq"], None if g is None else g.contiguous()]
+            has_grad = g is not None
             if opt is self.opts[0]:
                 extra, self.extra_means_grad = self.extra_means_grad, None
                 args.append(None if extra is None else extra.contiguous())
+                has_grad = has_grad or extra is not None
             if act is not None:
                 args.append(act)
-            args.append(self._hp(group, state))
+            # Like torch.optim.Adam: a parameter without gradient is skipped and
+            # its step count does not advance (the kernel skips it too).
+            args.append(self._hp(group, state) if has_grad else [0.9, 0.999, 1e-15, 0.0, 1.0])
         _make_lazy_cuda_func("geometry_adam")(*args)
 
 

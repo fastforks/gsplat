@@ -1276,7 +1276,9 @@ __global__ void spherical_harmonics_l1_plus_bwd_adam_kernel(
     { adam_elem(grad, p, m, v, beta1, beta2, eps, step_size, bias_correction2_sqrt); };
     // The launcher sizes blocks so that base and slab are multiples of 4 floats
     // whenever K * D * rows_per_block allows it; use float4 then.
-    const bool vec4 = (base % 4 == 0) && (slab % 4 == 0);
+    const bool vec4 = (base % 4 == 0) && (slab % 4 == 0)
+                      && ((reinterpret_cast<uintptr_t>(coeffs) | reinterpret_cast<uintptr_t>(exp_avg)
+                           | reinterpret_cast<uintptr_t>(exp_avg_sq)) % 16 == 0);
     if(vec4)
     {
         float4 *p4 = reinterpret_cast<float4 *>(coeffs + base);
