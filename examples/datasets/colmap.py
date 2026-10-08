@@ -450,11 +450,15 @@ class Dataset:
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
+        uint8_images: bool = False,
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
+        # Return decoded images as uint8 (4x smaller host-to-device copy);
+        # the caller converts to float on the device.
+        self.uint8_images = uint8_images
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
@@ -517,7 +521,7 @@ class Dataset:
         data = {
             "K": torch.from_numpy(K).float(),
             "camtoworld": torch.from_numpy(camtoworlds).float(),
-            "image": image if self.images is not None else image.float(),
+            "image": image if self.images is not None or self.uint8_images else image.float(),
             "image_id": item,  # the index of the image in the dataset
             "camera_idx": self.parser.camera_indices[
                 index
