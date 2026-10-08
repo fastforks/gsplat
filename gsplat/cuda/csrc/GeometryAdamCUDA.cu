@@ -20,7 +20,8 @@ namespace gsplat
 struct GeomAdamParam
 {
     float *p, *m, *v;
-    const float *g; // gradient w.r.t. the activated value (nullptr: zero)
+    const float *g;  // gradient w.r.t. the activated value (nullptr: zero)
+    const float *g2; // optional second gradient contribution, added to g
     const float *act; // activation output for the chain rule (nullptr: identity)
     float beta1, beta2, eps, step_size, bc2_sqrt;
 };
@@ -35,9 +36,12 @@ enum GeomAct
 __device__ __forceinline__ void geom_adam_elem(const GeomAdamParam &q, const int64_t i, const int act)
 {
     float grad = 0.f;
-    if(q.g != nullptr)
+    if(q.g != nullptr || q.g2 != nullptr)
     {
-        grad = q.g[i];
+        if(q.g != nullptr && q.g2 != nullptr)
+            grad = __fadd_rn(q.g[i], q.g2[i]); // what autograd's accumulation would do
+        else
+            grad = q.g != nullptr ? q.g[i] : q.g2[i];
         if(act == ACT_EXP)
         {
             grad = __fmul_rn(grad, q.act[i]); // exp backward: grad * result
@@ -88,7 +92,7 @@ __global__ void geometry_adam_kernel(
 }
 
 static GeomAdamParam make_param(
-    at::Tensor &p, at::Tensor &m, at::Tensor &v, const at::optional<at::Tensor> &g,
+    at::Tensor &p, at::Tensor &m, at::Tensor &v, const at::optional<at::Tensor> &g, const at::optional<at::Tensor> &g2,
     const at::optional<at::Tensor> &act, double beta1, double beta2, double eps, double step_size, double bc2_sqrt
 )
 {
@@ -101,6 +105,11 @@ static GeomAdamParam make_param(
         CHECK_INPUT(g.value());
         TORCH_CHECK(g.value().numel() == p.numel(), "gradient shape mismatch");
     }
+    if(g2.has_value())
+    {
+        CHECK_INPUT(g2.value());
+        TORCH_CHECK(g2.value().numel() == p.numel(), "gradient shape mismatch");
+    }
     if(act.has_value())
     {
         CHECK_INPUT(act.value());
@@ -109,6 +118,7 @@ static GeomAdamParam make_param(
     return GeomAdamParam{
         p.data_ptr<float>(), m.data_ptr<float>(), v.data_ptr<float>(),
         g.has_value() ? g.value().const_data_ptr<float>() : nullptr,
+        g2.has_value() ? g2.value().const_data_ptr<float>() : nullptr,
         act.has_value() ? act.value().const_data_ptr<float>() : nullptr,
         static_cast<float>(beta1), static_cast<float>(beta2), static_cast<float>(eps),
         static_cast<float>(step_size), static_cast<float>(bc2_sqrt)};
@@ -117,7 +127,7 @@ static GeomAdamParam make_param(
 // hp_* = [beta1, beta2, eps, step_size (lr / bias_correction1), bias_correction2_sqrt]
 void geometry_adam(
     at::Tensor &means, at::Tensor &means_m, at::Tensor &means_v, const at::optional<at::Tensor> &g_means,
-    at::ArrayRef<double> hp_means,
+    const at::optional<at::Tensor> &g2_means, at::ArrayRef<double> hp_means,
     at::Tensor &quats, at::Tensor &quats_m, at::Tensor &quats_v, const at::optional<at::Tensor> &g_quats,
     at::ArrayRef<double> hp_quats,
     at::Tensor &scales, at::Tensor &scales_m, at::Tensor &scales_v, const at::optional<at::Tensor> &g_scales,
@@ -134,10 +144,10 @@ void geometry_adam(
     {
         TORCH_CHECK(hp.size() == 5, "hyper-parameter lists must have 5 entries");
     }
-    auto pm = make_param(means, means_m, means_v, g_means, c10::nullopt, hp_means[0], hp_means[1], hp_means[2], hp_means[3], hp_means[4]);
-    auto pq = make_param(quats, quats_m, quats_v, g_quats, c10::nullopt, hp_quats[0], hp_quats[1], hp_quats[2], hp_quats[3], hp_quats[4]);
-    auto ps = make_param(scales, scales_m, scales_v, g_scales, scales_act, hp_scales[0], hp_scales[1], hp_scales[2], hp_scales[3], hp_scales[4]);
-    auto po = make_param(opac, opac_m, opac_v, g_opac, opac_act, hp_opac[0], hp_opac[1], hp_opac[2], hp_opac[3], hp_opac[4]);
+    auto pm = make_param(means, means_m, means_v, g_means, g2_means, c10::nullopt, hp_means[0], hp_means[1], hp_means[2], hp_means[3], hp_means[4]);
+    auto pq = make_param(quats, quats_m, quats_v, g_quats, c10::nullopt, c10::nullopt, hp_quats[0], hp_quats[1], hp_quats[2], hp_quats[3], hp_quats[4]);
+    auto ps = make_param(scales, scales_m, scales_v, g_scales, c10::nullopt, scales_act, hp_scales[0], hp_scales[1], hp_scales[2], hp_scales[3], hp_scales[4]);
+    auto po = make_param(opac, opac_m, opac_v, g_opac, c10::nullopt, opac_act, hp_opac[0], hp_opac[1], hp_opac[2], hp_opac[3], hp_opac[4]);
     const int64_t total = 11 * N;
     if(total == 0)
     {
