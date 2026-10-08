@@ -160,6 +160,28 @@ inline __device__ void warpSum(float *val, WarpT &warp)
     }
 }
 
+// Warp-wide sum of 16 per-lane values via reduce-scatter: 8+4+2+1+1 = 16
+// shuffles instead of 16 * 5 for 16 independent reductions. Must be called by
+// all 32 lanes. Returns, in every lane, the warp-wide sum of v[lane >> 1].
+// v is used as scratch.
+inline __device__ float warpReduceScatter16(float (&v)[16], const uint32_t lane)
+{
+#    pragma unroll
+    for(uint32_t mask = 16; mask >= 2; mask >>= 1)
+    {
+        const uint32_t half = mask / 2;
+        const bool upper    = lane & mask;
+#    pragma unroll
+        for(uint32_t i = 0; i < half; ++i)
+        {
+            const float send = upper ? v[i] : v[i + half];
+            const float keep = upper ? v[i + half] : v[i];
+            v[i]             = keep + __shfl_xor_sync(0xffffffffu, send, mask);
+        }
+    }
+    return v[0] + __shfl_xor_sync(0xffffffffu, v[0], 1);
+}
+
 template<class WarpT>
 inline __device__ void warpSum(float &val, WarpT &warp)
 {

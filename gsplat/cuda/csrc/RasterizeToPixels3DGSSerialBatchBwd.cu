@@ -282,41 +282,89 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
                     buffer[k] += rgbs_batch[t * CDIM + k] * fac;
                 }
             }
-            warpSum<CDIM>(v_rgb_local, warp);
-            warpSum(v_conic_local, warp);
-            warpSum(v_xy_local, warp);
-            if(v_means2d_abs != nullptr)
+            if constexpr(CDIM + 8 <= 16)
             {
-                warpSum(v_xy_abs_local, warp);
-            }
-            warpSum(v_opacity_local, warp);
-            if(warp.thread_rank() == 0)
-            {
-                int32_t g        = id_batch[t]; // flatten index in [I * N] or [nnz]
-                float *v_rgb_ptr = (float *)(v_colors) + CDIM * g;
+                // Reduce all gradient components at once; lane 2k ends up
+                // holding component k and issues its atomic in parallel.
+                // Layout: rgb[CDIM], conic[3], xy[2], xy_abs[2], opacity.
+                float vals[16];
+#    pragma unroll
+                for(uint32_t k = 0; k < 16; ++k)
+                {
+                    vals[k] = 0.f;
+                }
 #    pragma unroll
                 for(uint32_t k = 0; k < CDIM; ++k)
                 {
-                    atomicAdd_system(v_rgb_ptr + k, v_rgb_local[k]);
+                    vals[k] = v_rgb_local[k];
                 }
-
-                float *v_conic_ptr = (float *)(v_conics) + 3 * g;
-                atomicAdd_system(v_conic_ptr, v_conic_local.x);
-                atomicAdd_system(v_conic_ptr + 1, v_conic_local.y);
-                atomicAdd_system(v_conic_ptr + 2, v_conic_local.z);
-
-                float *v_xy_ptr = (float *)(v_means2d) + 2 * g;
-                atomicAdd_system(v_xy_ptr, v_xy_local.x);
-                atomicAdd_system(v_xy_ptr + 1, v_xy_local.y);
-
+                vals[CDIM + 0]      = v_conic_local.x;
+                vals[CDIM + 1]      = v_conic_local.y;
+                vals[CDIM + 2]      = v_conic_local.z;
+                vals[CDIM + 3]      = v_xy_local.x;
+                vals[CDIM + 4]      = v_xy_local.y;
+                vals[CDIM + 5]      = v_xy_abs_local.x;
+                vals[CDIM + 6]      = v_xy_abs_local.y;
+                vals[CDIM + 7]      = v_opacity_local;
+                const uint32_t lane = warp.thread_rank();
+                const float sum     = warpReduceScatter16(vals, lane);
+                const uint32_t c    = lane >> 1;
+                if((lane & 1) == 0 && c < CDIM + 8)
+                {
+                    const int32_t g = id_batch[t]; // flatten index in [I * N] or [nnz]
+                    float *ptr      = nullptr;
+                    if(c < CDIM)
+                        ptr = v_colors + CDIM * g + c;
+                    else if(c < CDIM + 3)
+                        ptr = (float *)(v_conics) + 3 * g + (c - CDIM);
+                    else if(c < CDIM + 5)
+                        ptr = (float *)(v_means2d) + 2 * g + (c - CDIM - 3);
+                    else if(c < CDIM + 7)
+                        ptr = v_means2d_abs == nullptr ? nullptr : (float *)(v_means2d_abs) + 2 * g + (c - CDIM - 5);
+                    else
+                        ptr = v_opacities + g;
+                    if(ptr != nullptr)
+                        atomicAdd_system(ptr, sum);
+                }
+            }
+            else
+            {
+                warpSum<CDIM>(v_rgb_local, warp);
+                warpSum(v_conic_local, warp);
+                warpSum(v_xy_local, warp);
                 if(v_means2d_abs != nullptr)
                 {
-                    float *v_xy_abs_ptr = (float *)(v_means2d_abs) + 2 * g;
-                    atomicAdd_system(v_xy_abs_ptr, v_xy_abs_local.x);
-                    atomicAdd_system(v_xy_abs_ptr + 1, v_xy_abs_local.y);
+                    warpSum(v_xy_abs_local, warp);
                 }
+                warpSum(v_opacity_local, warp);
+                if(warp.thread_rank() == 0)
+                {
+                    int32_t g        = id_batch[t]; // flatten index in [I * N] or [nnz]
+                    float *v_rgb_ptr = (float *)(v_colors) + CDIM * g;
+    #    pragma unroll
+                    for(uint32_t k = 0; k < CDIM; ++k)
+                    {
+                        atomicAdd_system(v_rgb_ptr + k, v_rgb_local[k]);
+                    }
 
-                atomicAdd_system(v_opacities + g, v_opacity_local);
+                    float *v_conic_ptr = (float *)(v_conics) + 3 * g;
+                    atomicAdd_system(v_conic_ptr, v_conic_local.x);
+                    atomicAdd_system(v_conic_ptr + 1, v_conic_local.y);
+                    atomicAdd_system(v_conic_ptr + 2, v_conic_local.z);
+
+                    float *v_xy_ptr = (float *)(v_means2d) + 2 * g;
+                    atomicAdd_system(v_xy_ptr, v_xy_local.x);
+                    atomicAdd_system(v_xy_ptr + 1, v_xy_local.y);
+
+                    if(v_means2d_abs != nullptr)
+                    {
+                        float *v_xy_abs_ptr = (float *)(v_means2d_abs) + 2 * g;
+                        atomicAdd_system(v_xy_abs_ptr, v_xy_abs_local.x);
+                        atomicAdd_system(v_xy_abs_ptr + 1, v_xy_abs_local.y);
+                    }
+
+                    atomicAdd_system(v_opacities + g, v_opacity_local);
+                }
             }
         }
     }
