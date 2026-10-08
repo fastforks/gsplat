@@ -149,6 +149,9 @@ class Config:
     # memory, instead of decoding one image per step (COLMAP data only). Costs
     # the decoded training set in host memory on every rank.
     cache_images: bool = False
+    # DataLoader worker processes decoding training images. Early in training
+    # (few Gaussians) 4 workers cap a garden/4 run at ~130 steps/s.
+    num_workers: int = 4
     # Steps to evaluate the model
     eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Steps to save the model
@@ -935,7 +938,7 @@ class Runner:
             self.trainset,
             batch_size=cfg.batch_size,
             shuffle=True,
-            num_workers=4,
+            num_workers=cfg.num_workers,
             persistent_workers=True,
             pin_memory=True,
         )
