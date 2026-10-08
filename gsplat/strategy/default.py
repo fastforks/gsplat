@@ -117,6 +117,9 @@ class DefaultStrategy(Strategy):
     # Update the grad2d / count running stats with one fused CUDA op instead of
     # several tensor ops (same values; dense [C, N] layout, no scale2d tracking).
     fused_state_update: bool = False
+    # Capture the 2D-means gradient with a hook instead of retain_grad(): the
+    # same tensor without the copy retain_grad makes; info[key].grad stays None.
+    grad_hook: bool = False
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy.
@@ -172,7 +175,17 @@ class DefaultStrategy(Strategy):
         assert (
             self.key_for_gradient in info
         ), "The 2D means of the Gaussians is required but missing."
-        info[self.key_for_gradient].retain_grad()
+        if self.grad_hook and not self.absgrad:
+            # The hook must not reference info (info -> tensor -> hook -> info
+            # would keep every step's graph alive until garbage collection).
+            box = info["_grad2d"] = [None]
+
+            def _keep(g):
+                box[0] = g
+
+            info[self.key_for_gradient].register_hook(_keep)
+        else:
+            info[self.key_for_gradient].retain_grad()
 
     def step_post_backward(
         self,
@@ -249,7 +262,7 @@ class DefaultStrategy(Strategy):
         if self.absgrad:
             grads = info[self.key_for_gradient].absgrad
         else:
-            grads = info[self.key_for_gradient].grad
+            grads = info["_grad2d"][0] if self.grad_hook else info[self.key_for_gradient].grad
         sx = info["width"] / 2.0 * info["n_cameras"]
         sy = info["height"] / 2.0 * info["n_cameras"]
 
