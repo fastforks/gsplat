@@ -65,6 +65,7 @@ from gsplat.cuda._wrapper import (
     isect_tiles,
     rasterize_to_pixels,
 )
+from gsplat.optimizers.geometry_adam import GeometryAdam
 from gsplat.optimizers.fused_sh_adam import (
     LazySHAdam,
     sh_colors_fused_adam,
@@ -193,6 +194,9 @@ class Config:
     # gradient skip their Adam step; the deferred zero-gradient steps are replayed
     # bit-exactly when the row is next needed (see gsplat.optimizers.LazySHAdam).
     lazy_sh_adam: bool = False
+    # Apply the Adam steps of means/quats/scales/opacities (with the exp/sigmoid
+    # activation backward) in one fused kernel inside the backward pass.
+    fused_geometry_adam: bool = False
     # Turn on another SH degree every this steps
     sh_degree_interval: int = 1000
     # Initial opacity of GS
@@ -457,6 +461,9 @@ class Runner:
                 raise ValueError("fused training optimizers support single-process training only")
             if cfg.pose_opt:
                 raise ValueError("fused SH optimizers do not support pose optimization")
+        if cfg.fused_geometry_adam:
+            assert cfg.opacity_reg == 0 and cfg.scale_reg == 0, "regularizers would bypass the fused step"
+            assert not cfg.visible_adam and not cfg.sparse_grad and not cfg.app_opt
         if cfg.lazy_sh_adam:
             assert not cfg.packed and cfg.camera_model == "pinhole" and not cfg.with_ut and not cfg.with_eval3d
             assert isinstance(cfg.strategy, DefaultStrategy), "lazy_sh_adam supports DefaultStrategy"
@@ -583,6 +590,7 @@ class Runner:
             if cfg.lazy_sh_adam
             else None
         )
+        self.geo_adam = GeometryAdam(self.optimizers) if cfg.fused_geometry_adam else None
         self.splats = self.scene.splats
         self.stage = Stage()
         self.stage.add_scene(self.scene, self.rasterize_splats)
@@ -790,12 +798,18 @@ class Runner:
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         splats = splats if splats is not None else self.splats
-        means = splats["means"]  # [N, 3]
-        # quats = F.normalize(splats["quats"], dim=-1)  # [N, 4]
-        # rasterization does normalization internally
-        quats = splats["quats"]  # [N, 4]
-        scales = torch.exp(splats["scales"])  # [N, 3]
-        opacities = torch.sigmoid(splats["opacities"])  # [N,]
+        if self.geo_adam is not None and splats is self.splats:
+            # Activations whose backward applies the geometry Adam steps directly.
+            means, quats, scales, opacities = self.geo_adam.activate(
+                splats["means"], splats["quats"], splats["scales"], splats["opacities"]
+            )
+        else:
+            means = splats["means"]  # [N, 3]
+            # quats = F.normalize(splats["quats"], dim=-1)  # [N, 4]
+            # rasterization does normalization internally
+            quats = splats["quats"]  # [N, 4]
+            scales = torch.exp(splats["scales"])  # [N, 3]
+            opacities = torch.sigmoid(splats["opacities"])  # [N,]
 
         image_ids = kwargs.pop("image_ids", None)
         if self.cfg.app_opt:
