@@ -17,7 +17,7 @@ from typing import Dict
 import torch
 from torch import Tensor
 
-from ..cuda._wrapper import _make_lazy_cuda_func, _make_lazy_cuda_obj
+from ..cuda._wrapper import _make_lazy_cuda_func
 
 
 class GeometryAdam:
@@ -79,8 +79,8 @@ class GeometryAdam:
                         self._hp(group, state) if has_grad else [0.9, 0.999, 1e-15, 0.0, 1.0]))
         return out
 
-    def step_projection(self, g_means, g_opac, scales_act, opac_act, viewmats, Ks, width, height,
-                        radii, conics, v_means2d, v_depths, v_conics):
+    def step_projection(self, g_means, g_opac, viewmats, Ks, width, height, radii, conics, v_means2d,
+                        v_depths, v_conics):
         extra, self.extra_means_grad = self.extra_means_grad, None
         if g_means is not None:  # another consumer of means through autograd
             extra = g_means if extra is None else extra + g_means
@@ -90,8 +90,8 @@ class GeometryAdam:
         _make_lazy_cuda_func("projection_geometry_adam")(
             pm, mm, vm, None if extra is None else extra.contiguous(), hm,
             pq, mq, vq, hq,
-            ps, ms, vs, scales_act, hs,
-            po, mo, vo, None if g_opac is None else g_opac.contiguous(), opac_act, ho,
+            ps, ms, vs, hs,
+            po, mo, vo, None if g_opac is None else g_opac.contiguous(), ho,
             viewmats, Ks, width, height, radii, conics, v_means2d.contiguous(),
             None if v_depths is None else v_depths.contiguous(), v_conics.contiguous(),
         )
@@ -134,26 +134,24 @@ class _ProjectGeomAdam(torch.autograd.Function):
     @staticmethod
     def forward(ctx, mgr, means, quats, log_scales, opacity_logits, viewmats, Ks, width, height, eps2d,
                 near_plane, far_plane):
-        scales = torch.exp(log_scales)
-        opac = torch.sigmoid(opacity_logits)
-        camera_model = _make_lazy_cuda_obj("CameraModelType.PINHOLE")
-        radii, means2d, depths, conics, _ = _make_lazy_cuda_func("projection_ewa_3dgs_fused")(
-            means, None, quats, scales, opac, viewmats, Ks, width, height, eps2d,
-            near_plane, far_plane, 0.0, False, camera_model,
+        # exp / sigmoid are applied inside the projection (and recomputed in
+        # the backward), matching torch.exp / torch.sigmoid bit for bit.
+        radii, means2d, depths, conics, opac = _make_lazy_cuda_func("projection_act_fwd")(
+            means, quats, log_scales, opacity_logits, viewmats, Ks, width, height, eps2d, near_plane, far_plane,
         )
         ctx.mgr, ctx.width, ctx.height = mgr, width, height
         ctx.set_materialize_grads(False)
         ctx.mark_non_differentiable(radii)
-        ctx.save_for_backward(scales, opac, viewmats, Ks, radii, conics)
+        ctx.save_for_backward(viewmats, Ks, radii, conics)
         return means.view_as(means), opac, radii, means2d, depths, conics
 
     @staticmethod
     def backward(ctx, g_means, g_opac, _g_radii, v_means2d, v_depths, v_conics):
-        scales, opac, viewmats, Ks, radii, conics = ctx.saved_tensors
+        viewmats, Ks, radii, conics = ctx.saved_tensors
         if v_means2d is None:
-            v_means2d = torch.zeros_like(radii, dtype=scales.dtype)
+            v_means2d = torch.zeros_like(radii, dtype=conics.dtype)
         if v_conics is None:
             v_conics = torch.zeros_like(conics)
-        ctx.mgr.step_projection(g_means, g_opac, scales, opac, viewmats, Ks, ctx.width, ctx.height,
+        ctx.mgr.step_projection(g_means, g_opac, viewmats, Ks, ctx.width, ctx.height,
                                 radii, conics, v_means2d, v_depths, v_conics)
         return (None,) * 12

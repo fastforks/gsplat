@@ -1033,10 +1033,15 @@ TORCH_LIBRARY(gsplat, m)
     m.def(
         "projection_geometry_adam(Tensor(a!) means, Tensor(b!) means_m, Tensor(c!) means_v, Tensor? g2_means, float[] hp_means, "
         "Tensor(d!) quats, Tensor(e!) quats_m, Tensor(f!) quats_v, float[] hp_quats, "
-        "Tensor(g!) scales, Tensor(h!) scales_m, Tensor(i!) scales_v, Tensor scales_act, float[] hp_scales, "
-        "Tensor(j!) opac, Tensor(k!) opac_m, Tensor(l!) opac_v, Tensor? g_opac, Tensor opac_act, float[] hp_opac, "
+        "Tensor(g!) scales, Tensor(h!) scales_m, Tensor(i!) scales_v, float[] hp_scales, "
+        "Tensor(j!) opac, Tensor(k!) opac_m, Tensor(l!) opac_v, Tensor? g_opac, float[] hp_opac, "
         "Tensor viewmats, Tensor Ks, int image_width, int image_height, Tensor radii, Tensor conics, "
         "Tensor v_means2d, Tensor? v_depths, Tensor v_conics) -> ()"
+    );
+    m.def(
+        "projection_act_fwd(Tensor means, Tensor quats, Tensor log_scales, Tensor logits, Tensor viewmats, "
+        "Tensor Ks, int image_width, int image_height, float eps2d, float near_plane, float far_plane) "
+        "-> (Tensor, Tensor, Tensor, Tensor, Tensor)"
     );
     m.def("sh_colors_fused_fwd(int degrees_to_use, Tensor means, Tensor viewmats, Tensor sh0, Tensor shN) -> Tensor");
     m.def(
