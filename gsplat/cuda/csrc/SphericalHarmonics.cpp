@@ -1240,8 +1240,134 @@ at::optional<at::Tensor> sh_colors_fused_bwd_adam(
     return compute_v_means ? at::optional<at::Tensor>(v_means) : at::optional<at::Tensor>();
 }
 
+// Lazy-Adam SH colors (see SphericalHarmonicsL1PlusCUDA.cu). tabs is [4, T]:
+// sh0 step_size, sh0 bias_correction2_sqrt, shN step_size, shN
+// bias_correction2_sqrt, indexed by optimizer step.
+at::Tensor sh_colors_lazy_fwd(
+    int64_t degrees_to_use,
+    const at::Tensor &means,
+    const at::Tensor &viewmats,
+    const at::Tensor &mask,
+    const at::Tensor &sh0,
+    const at::Tensor &sh0_m,
+    const at::Tensor &sh0_v,
+    const at::Tensor &shN,
+    const at::Tensor &shN_m,
+    const at::Tensor &shN_v,
+    const at::Tensor &last,
+    int64_t step,
+    const at::Tensor &tabs,
+    double sh0_beta1,
+    double sh0_beta2,
+    double sh0_eps,
+    double shN_beta1,
+    double shN_beta2,
+    double shN_eps
+)
+{
+    DEVICE_GUARD(means);
+    CHECK_INPUT(means);
+    CHECK_INPUT(mask);
+    CHECK_INPUT(sh0);
+    CHECK_INPUT(sh0_m);
+    CHECK_INPUT(sh0_v);
+    CHECK_INPUT(shN);
+    CHECK_INPUT(shN_m);
+    CHECK_INPUT(shN_v);
+    CHECK_INPUT(last);
+    CHECK_INPUT(tabs);
+    TORCH_CHECK(shN.size(-1) <= 4, "lazy SH colors support up to 4 channels");
+    TORCH_CHECK(last.scalar_type() == at::kInt && last.numel() == shN.size(0), "last must be int32 [N]");
+    TORCH_CHECK(tabs.dim() == 2 && tabs.size(0) == 4 && step < tabs.size(1), "tabs must be [4, T] with T > step");
+    const at::Tensor vm = viewmats.contiguous();
+    TORCH_CHECK(mask.scalar_type() == at::kBool && mask.numel() == vm.numel() / 16 * shN.size(0), "mask must be [C, N]");
+    auto colors = at::empty({vm.numel() / 16, shN.size(0), shN.size(2)}, means.options());
+    launch_sh_colors_lazy_fwd_kernel(
+        degrees_to_use, means, vm, mask, sh0, sh0_m, sh0_v, shN, shN_m, shN_v, last, static_cast<int>(step), tabs,
+        sh0_beta1, sh0_beta2, sh0_eps, shN_beta1, shN_beta2, shN_eps, colors
+    );
+    return colors;
+}
+
+at::optional<at::Tensor> sh_colors_lazy_bwd_adam(
+    int64_t degrees_to_use,
+    const at::Tensor &means,
+    const at::Tensor &viewmats,
+    const at::Tensor &v_colors,
+    at::Tensor &sh0,
+    at::Tensor &sh0_m,
+    at::Tensor &sh0_v,
+    at::Tensor &shN,
+    at::Tensor &shN_m,
+    at::Tensor &shN_v,
+    at::Tensor &last,
+    int64_t step,
+    const at::Tensor &tabs,
+    double sh0_beta1,
+    double sh0_beta2,
+    double sh0_eps,
+    double shN_beta1,
+    double shN_beta2,
+    double shN_eps,
+    bool compute_v_means
+)
+{
+    DEVICE_GUARD(means);
+    CHECK_INPUT(means);
+    CHECK_INPUT(sh0);
+    CHECK_INPUT(sh0_m);
+    CHECK_INPUT(sh0_v);
+    CHECK_INPUT(shN);
+    CHECK_INPUT(shN_m);
+    CHECK_INPUT(shN_v);
+    CHECK_INPUT(last);
+    CHECK_INPUT(tabs);
+    TORCH_CHECK(step < tabs.size(1), "tabs too short");
+    at::Tensor grad_colors = v_colors.contiguous();
+    at::Tensor v_means;
+    if(compute_v_means)
+    {
+        v_means = at::zeros_like(means);
+    }
+    launch_sh_colors_lazy_bwd_adam_kernel(
+        degrees_to_use, means, viewmats.contiguous(), grad_colors, sh0, sh0_m, sh0_v, shN, shN_m, shN_v, last,
+        static_cast<int>(step), tabs, sh0_beta1, sh0_beta2, sh0_eps, shN_beta1, shN_beta2, shN_eps,
+        as_optional_tensor(v_means)
+    );
+    return compute_v_means ? at::optional<at::Tensor>(v_means) : at::optional<at::Tensor>();
+}
+
+void sh_lazy_catchup(
+    at::Tensor &p,
+    at::Tensor &m,
+    at::Tensor &v,
+    const at::Tensor &last,
+    int64_t step,
+    const at::Tensor &step_size_tab,
+    const at::Tensor &bc2_sqrt_tab,
+    double beta1,
+    double beta2,
+    double eps
+)
+{
+    DEVICE_GUARD(p);
+    CHECK_INPUT(p);
+    CHECK_INPUT(m);
+    CHECK_INPUT(v);
+    CHECK_INPUT(last);
+    TORCH_CHECK(step_size_tab.is_contiguous() && bc2_sqrt_tab.is_contiguous(), "tables must be contiguous");
+    TORCH_CHECK(last.numel() == p.size(0), "last must be [N]");
+    launch_sh_lazy_catchup_kernel(
+        p, m, v, last, static_cast<int>(step), step_size_tab, bc2_sqrt_tab, static_cast<float>(beta1),
+        static_cast<float>(beta2), static_cast<float>(eps)
+    );
+}
+
 void register_spherical_harmonics_cuda_impl(torch::Library &m)
 {
+    m.impl("sh_colors_lazy_fwd", &sh_colors_lazy_fwd);
+    m.impl("sh_colors_lazy_bwd_adam", &sh_colors_lazy_bwd_adam);
+    m.impl("sh_lazy_catchup", &sh_lazy_catchup);
     m.impl("spherical_harmonics_l1_plus_bwd_adam", &spherical_harmonics_l1_plus_bwd_adam);
     m.impl("sh_colors_fused_fwd", &sh_colors_fused_fwd);
     m.impl("sh_colors_fused_bwd_adam", &sh_colors_fused_bwd_adam);
