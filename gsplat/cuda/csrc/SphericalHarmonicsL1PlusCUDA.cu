@@ -1104,4 +1104,204 @@ void launch_spherical_harmonics_l1_plus_bwd_kernels(
     }
     merge_streams();
 }
+// Backward of spherical_harmonics_l1_plus fused with the Adam update of shN.
+// Dense mode only (one coefficient row per gaussian). Each thread owns one
+// (gaussian, channel) column: it accumulates the shN gradient for that column in
+// registers over all images, then applies torch.optim.Adam's update (no weight
+// decay, no amsgrad) to the parameter and both moments in place, so the shN
+// gradient is never written to memory. Rows with zero gradient are still
+// updated, exactly as torch.optim.Adam does.
+template<int DEGREE>
+__global__ void spherical_harmonics_l1_plus_bwd_adam_kernel(
+    const uint32_t BC,
+    const uint32_t N,
+    const uint32_t K,
+    const uint32_t D,
+    const uint32_t rows_per_block,
+    const float *__restrict__ means,
+    const float *__restrict__ viewmats,
+    float *__restrict__ coeffs,         // [N, K, D] updated in place
+    const float *__restrict__ v_colors, // [B*C, N, D]
+    float *__restrict__ exp_avg,        // [N, K, D]
+    float *__restrict__ exp_avg_sq,     // [N, K, D]
+    float *__restrict__ v_means,        // [N, 3] or nullptr
+    const float step_size,              // lr / bias_correction1
+    const float beta1,
+    const float beta2,
+    const float eps,
+    const float bias_correction2_sqrt
+)
+{
+    // Phase 1: one thread per (gaussian, channel) computes that column's shN
+    // gradient (as in spherical_harmonics_l1_plus_bwd_kernel) and stages it in
+    // shared memory. Phase 2: all threads sweep the block's contiguous
+    // [rows_per_block, K, D] slab with coalesced Adam updates.
+    extern __shared__ float grad_slab[]; // [rows_per_block * K * D]
+    const uint32_t tid      = threadIdx.x;
+    const int64_t row_begin = static_cast<int64_t>(blockIdx.x) * rows_per_block;
+    const uint32_t rows     = static_cast<uint32_t>(N - row_begin < rows_per_block ? N - row_begin : rows_per_block);
+    const uint32_t local    = tid / D;
+    const uint32_t c        = tid % D;
+    const int64_t coeff_id  = row_begin + local;
+
+    constexpr int MAX_K = (DEGREE + 1) * (DEGREE + 1) - 1;
+    float acc[MAX_K > 0 ? MAX_K : 1];
+#pragma unroll
+    for(int k = 0; k < (MAX_K > 0 ? MAX_K : 1); ++k)
+    {
+        acc[k] = 0.f;
+    }
+
+    if(local < rows)
+    {
+        if constexpr(DEGREE > 0)
+        {
+            const float *coeffs_ptr = coeffs + coeff_id * K * D;
+            for(uint32_t image_id = 0; image_id < BC; ++image_id)
+            {
+                const int64_t output_id = static_cast<int64_t>(image_id) * N + coeff_id;
+                vec3 v_dir              = {0.f, 0.f, 0.f};
+                if(v_colors[output_id * D + c] != 0.f)
+                {
+                    const vec3 dir = view_direction_from_camera_data(means + coeff_id * 3, viewmats, nullptr, image_id);
+                    sh_l1_plus_coeffs_to_color_fast_vjp<float>(
+                        DEGREE, D, c, dir, coeffs_ptr, v_colors + output_id * D, acc, v_means == nullptr ? nullptr : &v_dir
+                    );
+                }
+                if(v_means != nullptr && reduce_view_direction_channels(coeff_id, v_dir))
+                {
+                    float *v_mean = v_means + coeff_id * 3;
+                    gpuAtomicAdd(v_mean, v_dir.x);
+                    gpuAtomicAdd(v_mean + 1, v_dir.y);
+                    gpuAtomicAdd(v_mean + 2, v_dir.z);
+                }
+            }
+        }
+#pragma unroll
+        for(int k = 0; k < MAX_K; ++k)
+        {
+            if(static_cast<uint32_t>(k) < K)
+                grad_slab[local * K * D + k * D + c] = acc[k];
+        }
+        for(uint32_t k = MAX_K; k < K; ++k)
+        {
+            grad_slab[local * K * D + k * D + c] = 0.f;
+        }
+    }
+    __syncthreads();
+
+    // Adam, matching ATen's fused Adam (ADAM_MODE::ORIGINAL, weight_decay=0).
+    const float one_minus_beta1 = 1.f - beta1;
+    const float one_minus_beta2 = 1.f - beta2;
+    const uint32_t slab         = rows * K * D;
+    const int64_t base          = row_begin * K * D;
+    auto adam = [&](const float grad, float &p, float &m, float &v)
+    {
+        m              = beta1 * m + one_minus_beta1 * grad;
+        v              = beta2 * v + one_minus_beta2 * grad * grad;
+        const float den = sqrtf(v) / bias_correction2_sqrt + eps;
+        p              -= step_size * m / den;
+    };
+    // The launcher sizes blocks so that base and slab are multiples of 4 floats
+    // whenever K * D * rows_per_block allows it; use float4 then.
+    const bool vec4 = (base % 4 == 0) && (slab % 4 == 0);
+    if(vec4)
+    {
+        float4 *p4 = reinterpret_cast<float4 *>(coeffs + base);
+        float4 *m4 = reinterpret_cast<float4 *>(exp_avg + base);
+        float4 *v4 = reinterpret_cast<float4 *>(exp_avg_sq + base);
+        for(uint32_t e = tid; e < slab / 4; e += blockDim.x)
+        {
+            float4 p = p4[e], m = m4[e], v = v4[e];
+            adam(grad_slab[4 * e + 0], p.x, m.x, v.x);
+            adam(grad_slab[4 * e + 1], p.y, m.y, v.y);
+            adam(grad_slab[4 * e + 2], p.z, m.z, v.z);
+            adam(grad_slab[4 * e + 3], p.w, m.w, v.w);
+            p4[e] = p;
+            m4[e] = m;
+            v4[e] = v;
+        }
+    }
+    else
+    {
+        for(uint32_t e = tid; e < slab; e += blockDim.x)
+        {
+            const int64_t i = base + e;
+            float p = coeffs[i], m = exp_avg[i], v = exp_avg_sq[i];
+            adam(grad_slab[e], p, m, v);
+            coeffs[i]     = p;
+            exp_avg[i]    = m;
+            exp_avg_sq[i] = v;
+        }
+    }
+}
+
+void launch_spherical_harmonics_l1_plus_bwd_adam_kernel(
+    const uint32_t degrees_to_use,
+    const at::Tensor means,      // [N, 3]
+    const at::Tensor viewmats,   // [B*C, 4, 4]
+    at::Tensor coeffs,           // [N, K, D]
+    const at::Tensor v_colors,   // [B*C, N, D]
+    at::Tensor exp_avg,
+    at::Tensor exp_avg_sq,
+    at::optional<at::Tensor> v_means,
+    const float step_size,
+    const float beta1,
+    const float beta2,
+    const float eps,
+    const float bias_correction2_sqrt
+)
+{
+    const uint32_t D  = coeffs.size(-1);
+    const uint32_t K  = coeffs.size(-2);
+    const uint32_t N  = coeffs.size(0);
+    const uint32_t BC = viewmats.numel() / 16;
+    if(N == 0)
+    {
+        return;
+    }
+    TORCH_CHECK(D >= 1 && D <= 256, "fused SH Adam supports 1..256 channels");
+    // Multiple of 4 rows keeps every block's slab 16-byte aligned for float4.
+    const uint32_t rows_per_block = 256 / D >= 4 ? (256 / D) / 4 * 4 : 256 / D;
+    const unsigned int threads    = rows_per_block * D;
+    const unsigned int blocks     = (N + rows_per_block - 1) / rows_per_block;
+    const size_t shmem            = static_cast<size_t>(rows_per_block) * K * D * sizeof(float);
+    auto stream                   = at::cuda::getCurrentCUDAStream();
+    const bool dispatched         = dispatch::dispatch(
+        dispatch::IntParam<0, 1, 2, 3>{static_cast<int>(degrees_to_use)},
+        [&]<typename DegConst>()
+        {
+            constexpr int DEGREE = DegConst::value;
+            if(shmem > 48 * 1024)
+            {
+                C10_CUDA_CHECK(cudaFuncSetAttribute(
+                    spherical_harmonics_l1_plus_bwd_adam_kernel<DEGREE>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    static_cast<int>(shmem)
+                ));
+            }
+            spherical_harmonics_l1_plus_bwd_adam_kernel<DEGREE><<<blocks, threads, shmem, stream>>>(
+                BC,
+                N,
+                K,
+                D,
+                rows_per_block,
+                means.const_data_ptr<float>(),
+                viewmats.const_data_ptr<float>(),
+                coeffs.data_ptr<float>(),
+                v_colors.const_data_ptr<float>(),
+                exp_avg.data_ptr<float>(),
+                exp_avg_sq.data_ptr<float>(),
+                v_means.has_value() ? v_means.value().data_ptr<float>() : nullptr,
+                step_size,
+                beta1,
+                beta2,
+                eps,
+                bias_correction2_sqrt
+            );
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
+    );
+    TORCH_CHECK(dispatched, "Unsupported SH degree: ", degrees_to_use);
+}
 } // namespace gsplat

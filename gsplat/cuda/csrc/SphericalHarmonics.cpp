@@ -1091,8 +1091,62 @@ SphericalHarmonicsBwdResult spherical_harmonics_l1_plus_bwd_privateuseone(
     };
 }
 
+// Backward of spherical_harmonics_l1_plus fused with an in-place Adam step on
+// shN (see launch_spherical_harmonics_l1_plus_bwd_adam_kernel). Returns v_means.
+at::optional<at::Tensor> spherical_harmonics_l1_plus_bwd_adam(
+    int64_t degrees_to_use,
+    const at::Tensor &means,
+    const at::Tensor &viewmats,
+    at::Tensor &shN,
+    const at::Tensor &v_colors,
+    at::Tensor &exp_avg,
+    at::Tensor &exp_avg_sq,
+    double step_size,
+    double beta1,
+    double beta2,
+    double eps,
+    double bias_correction2_sqrt,
+    bool compute_v_means
+)
+{
+    DEVICE_GUARD(means);
+    CHECK_INPUT(means);
+    CHECK_INPUT(viewmats);
+    CHECK_INPUT(shN);
+    CHECK_INPUT(exp_avg);
+    CHECK_INPUT(exp_avg_sq);
+    TORCH_CHECK(means.dim() == 2 && means.size(1) == 3, "fused SH Adam supports unbatched means [N, 3] only");
+    TORCH_CHECK(shN.scalar_type() == at::kFloat, "fused SH Adam requires fp32 shN");
+    TORCH_CHECK(shN.dim() == 3 && shN.size(0) == means.size(0), "shN must be [N, K, D]");
+    TORCH_CHECK(exp_avg.sizes() == shN.sizes() && exp_avg_sq.sizes() == shN.sizes(), "Adam state shape mismatch");
+    at::Tensor grad_colors = v_colors.contiguous();
+    TORCH_CHECK(grad_colors.numel() == viewmats.numel() / 16 * shN.size(0) * shN.size(2), "v_colors must be [C, N, D]");
+    at::Tensor v_means;
+    if(compute_v_means)
+    {
+        v_means = at::zeros_like(means);
+    }
+    launch_spherical_harmonics_l1_plus_bwd_adam_kernel(
+        degrees_to_use,
+        means,
+        viewmats.contiguous(),
+        shN,
+        grad_colors,
+        exp_avg,
+        exp_avg_sq,
+        as_optional_tensor(v_means),
+        static_cast<float>(step_size),
+        static_cast<float>(beta1),
+        static_cast<float>(beta2),
+        static_cast<float>(eps),
+        static_cast<float>(bias_correction2_sqrt)
+    );
+    return compute_v_means ? at::optional<at::Tensor>(v_means) : at::optional<at::Tensor>();
+}
+
 void register_spherical_harmonics_cuda_impl(torch::Library &m)
 {
+    m.impl("spherical_harmonics_l1_plus_bwd_adam", &spherical_harmonics_l1_plus_bwd_adam);
     m.impl("spherical_harmonics", to_torch_op<&spherical_harmonics_fwd>);
     m.impl("spherical_harmonics_bwd", to_torch_op<&spherical_harmonics_bwd>);
     m.impl("spherical_harmonics_l0", to_torch_op<&spherical_harmonics_l0_fwd>);

@@ -121,6 +121,22 @@ void launch_spherical_harmonics_bwd_kernel(
     at::optional<at::Tensor> v_viewmats_rs
 );
 
+void launch_spherical_harmonics_l1_plus_bwd_adam_kernel(
+    const uint32_t degrees_to_use,
+    const at::Tensor means,
+    const at::Tensor viewmats,
+    at::Tensor coeffs,
+    const at::Tensor v_colors,
+    at::Tensor exp_avg,
+    at::Tensor exp_avg_sq,
+    at::optional<at::Tensor> v_means,
+    const float step_size,
+    const float beta1,
+    const float beta2,
+    const float eps,
+    const float bias_correction2_sqrt
+);
+
 void launch_spherical_harmonics_l1_plus_bwd_kernel(
     // inputs
     const uint32_t degrees_to_use,
