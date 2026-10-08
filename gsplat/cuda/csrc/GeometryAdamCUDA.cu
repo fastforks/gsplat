@@ -9,6 +9,7 @@
 // torch.optim.Adam (weight_decay=0, amsgrad=False) given its gradient.
 
 #include <ATen/core/Tensor.h>
+#include <ATen/ops/empty.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/library.h>
 
@@ -24,6 +25,7 @@ struct GeomAdamParam
     const float *g;  // gradient w.r.t. the activated value (nullptr: zero)
     const float *g2; // optional second gradient contribution, added to g
     const float *act; // activation output for the chain rule (nullptr: identity)
+    bool act_from_p;  // recompute the activation from p instead of reading act
     float beta1, beta2, eps, step_size, bc2_sqrt;
     bool skip; // no gradient this step: torch.optim.Adam skips the parameter
 };
@@ -34,6 +36,18 @@ enum GeomAct
     ACT_EXP  = 1,
     ACT_SIGMOID = 2
 };
+
+extern "C" __device__ float __nv_expf(float);
+
+// torch.exp / torch.sigmoid on CUDA, bit for bit. The library expf is called
+// directly because -use_fast_math would turn expf() into __expf(). Results in
+// the denormal range (|x| > ~87) are flushed to zero under fast math, where
+// torch keeps the denormal.
+__device__ __forceinline__ float act_exp(const float x) { return __nv_expf(x); }
+__device__ __forceinline__ float act_sigmoid(const float x)
+{
+    return __fdiv_rn(1.f, __fadd_rn(1.f, __nv_expf(-x)));
+}
 
 // The torch.optim.Adam update of element i given its (activated) gradient and
 // current value p; writes p, m, v.
@@ -56,6 +70,7 @@ __device__ __forceinline__ void geom_adam_elem(const GeomAdamParam &q, const int
         return;
     }
     float grad = 0.f;
+    const float p0 = q.p[i];
     if(q.g != nullptr || q.g2 != nullptr)
     {
         if(q.g != nullptr && q.g2 != nullptr)
@@ -64,16 +79,15 @@ __device__ __forceinline__ void geom_adam_elem(const GeomAdamParam &q, const int
             grad = q.g != nullptr ? q.g[i] : q.g2[i];
         if(act == ACT_EXP)
         {
-            grad = __fmul_rn(grad, q.act[i]); // exp backward: grad * result
+            grad = __fmul_rn(grad, q.act_from_p ? act_exp(p0) : q.act[i]); // exp backward: grad * result
         }
         else if(act == ACT_SIGMOID)
         {
-            const float y = q.act[i]; // sigmoid backward: grad * (1 - y) * y
+            const float y = q.act_from_p ? act_sigmoid(p0) : q.act[i]; // sigmoid backward: grad * (1 - y) * y
             grad          = __fmul_rn(__fmul_rn(grad, __fsub_rn(1.f, y)), y);
         }
     }
-    float p = q.p[i];
-    geom_adam_apply(q, i, grad, p);
+    geom_adam_apply(q, i, grad, p0);
 }
 
 __global__ void geometry_adam_kernel(
@@ -134,7 +148,7 @@ static GeomAdamParam make_param(
         g.has_value() ? g.value().const_data_ptr<float>() : nullptr,
         g2.has_value() ? g2.value().const_data_ptr<float>() : nullptr,
         act.has_value() ? act.value().const_data_ptr<float>() : nullptr,
-        static_cast<float>(beta1), static_cast<float>(beta2), static_cast<float>(eps),
+        false, static_cast<float>(beta1), static_cast<float>(beta2), static_cast<float>(eps),
         static_cast<float>(step_size), static_cast<float>(bc2_sqrt), !g.has_value() && !g2.has_value()};
 }
 
@@ -196,8 +210,8 @@ __global__ void projection_geometry_adam_kernel(
     const float *__restrict__ v_conics,    // [N, 3]
     const GeomAdamParam means,             // g2 = extra means gradient (optional), g unused
     const GeomAdamParam quats,
-    const GeomAdamParam scales,            // act = exp(log-scales), also the projection input
-    const GeomAdamParam opac               // g = opacity gradient (optional), act = sigmoid
+    const GeomAdamParam scales,            // log-scales; exp recomputed (projection input)
+    const GeomAdamParam opac               // g = opacity gradient (optional); sigmoid recomputed
 )
 {
     const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -207,7 +221,9 @@ __global__ void projection_geometry_adam_kernel(
     }
     const vec3 mean  = vec3(means.p[i * 3], means.p[i * 3 + 1], means.p[i * 3 + 2]);
     const vec4 quat  = vec4(quats.p[i * 4], quats.p[i * 4 + 1], quats.p[i * 4 + 2], quats.p[i * 4 + 3]);
-    const vec3 scale = vec3(scales.act[i * 3], scales.act[i * 3 + 1], scales.act[i * 3 + 2]);
+    // scales holds log-scales; the activation is recomputed (as in the forward).
+    const float ls[3] = {scales.p[i * 3], scales.p[i * 3 + 1], scales.p[i * 3 + 2]};
+    const vec3 scale  = vec3(act_exp(ls[0]), act_exp(ls[1]), act_exp(ls[2]));
 
     vec3 v_mean(0.f);
     vec4 v_quat(0.f);
@@ -267,7 +283,7 @@ __global__ void projection_geometry_adam_kernel(
     for(int k = 0; k < 3; ++k)
     {
         const int64_t e = i * 3 + k;
-        geom_adam_apply(scales, e, __fmul_rn(v_scale[k], scale[k]), scales.p[e]);
+        geom_adam_apply(scales, e, __fmul_rn(v_scale[k], scale[k]), ls[k]);
     }
     geom_adam_elem(opac, i, ACT_SIGMOID);
 }
@@ -278,10 +294,9 @@ void projection_geometry_adam(
     at::Tensor &means, at::Tensor &means_m, at::Tensor &means_v, const at::optional<at::Tensor> &g2_means,
     at::ArrayRef<double> hp_means,
     at::Tensor &quats, at::Tensor &quats_m, at::Tensor &quats_v, at::ArrayRef<double> hp_quats,
-    at::Tensor &scales, at::Tensor &scales_m, at::Tensor &scales_v, const at::Tensor &scales_act,
-    at::ArrayRef<double> hp_scales,
+    at::Tensor &scales, at::Tensor &scales_m, at::Tensor &scales_v, at::ArrayRef<double> hp_scales,
     at::Tensor &opac, at::Tensor &opac_m, at::Tensor &opac_v, const at::optional<at::Tensor> &g_opac,
-    const at::Tensor &opac_act, at::ArrayRef<double> hp_opac,
+    at::ArrayRef<double> hp_opac,
     const at::Tensor &viewmats, const at::Tensor &Ks, int64_t image_width, int64_t image_height,
     const at::Tensor &radii, const at::Tensor &conics, const at::Tensor &v_means2d,
     const at::optional<at::Tensor> &v_depths, const at::Tensor &v_conics
@@ -313,8 +328,10 @@ void projection_geometry_adam(
     // a dummy g marks them as such (it is not read).
     auto pm = make_param(means, means_m, means_v, means, g2_means, none, hp_means[0], hp_means[1], hp_means[2], hp_means[3], hp_means[4]);
     auto pq = make_param(quats, quats_m, quats_v, quats, none, none, hp_quats[0], hp_quats[1], hp_quats[2], hp_quats[3], hp_quats[4]);
-    auto ps = make_param(scales, scales_m, scales_v, scales, none, scales_act, hp_scales[0], hp_scales[1], hp_scales[2], hp_scales[3], hp_scales[4]);
-    auto po = make_param(opac, opac_m, opac_v, g_opac, none, opac_act, hp_opac[0], hp_opac[1], hp_opac[2], hp_opac[3], hp_opac[4]);
+    auto ps = make_param(scales, scales_m, scales_v, scales, none, none, hp_scales[0], hp_scales[1], hp_scales[2], hp_scales[3], hp_scales[4]);
+    auto po = make_param(opac, opac_m, opac_v, g_opac, none, none, hp_opac[0], hp_opac[1], hp_opac[2], hp_opac[3], hp_opac[4]);
+    ps.act_from_p = true;
+    po.act_from_p = true;
     if(N == 0)
     {
         return;
@@ -329,9 +346,148 @@ void projection_geometry_adam(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// Forward counterpart of projection_geometry_adam: projection_ewa_3dgs_fused
+// forward (pinhole, one camera, no compensation, radius_clip 0) that reads the
+// raw log-scales / opacity logits and applies exp / sigmoid on load, so no
+// activated copies are materialized. Writes sigmoid(logit) for every gaussian
+// (the rasterizer's opacities). Same arithmetic as the upstream kernel.
+__global__ void projection_act_fwd_kernel(
+    const int64_t N,
+    const float *__restrict__ means,      // [N, 3]
+    const float *__restrict__ quats,      // [N, 4]
+    const float *__restrict__ log_scales, // [N, 3]
+    const float *__restrict__ logits,     // [N]
+    const float *__restrict__ viewmat,    // [4, 4]
+    const float *__restrict__ K,          // [3, 3]
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const float eps2d,
+    const float near_plane,
+    const float far_plane,
+    int32_t *__restrict__ radii,  // [N, 2]
+    float *__restrict__ means2d,  // [N, 2]
+    float *__restrict__ depths,   // [N]
+    float *__restrict__ conics,   // [N, 3]
+    float *__restrict__ opac_out  // [N]
+)
+{
+    const int64_t gid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if(gid >= N)
+    {
+        return;
+    }
+    const float opacity = act_sigmoid(logits[gid]);
+    opac_out[gid]       = opacity;
+
+    mat3 R = mat3(
+        viewmat[0], viewmat[4], viewmat[8], // 1st column
+        viewmat[1], viewmat[5], viewmat[9], // 2nd column
+        viewmat[2], viewmat[6], viewmat[10] // 3rd column
+    );
+    vec3 t = vec3(viewmat[3], viewmat[7], viewmat[11]);
+    vec3 mean_c;
+    posW2C(R, t, glm::make_vec3(means + gid * 3), mean_c);
+    if(mean_c.z < near_plane || mean_c.z > far_plane)
+    {
+        radii[gid * 2]     = 0;
+        radii[gid * 2 + 1] = 0;
+        return;
+    }
+    const float *ls  = log_scales + gid * 3;
+    const vec3 scale = vec3(act_exp(ls[0]), act_exp(ls[1]), act_exp(ls[2]));
+    mat3 covar;
+    quat_scale_to_covar_preci(glm::make_vec4(quats + gid * 4), scale, &covar, nullptr);
+    mat3 covar_c;
+    covarW2C(R, covar, covar_c);
+    mat2 covar2d;
+    vec2 mean2d;
+    persp_proj(mean_c, covar_c, K[0], K[4], K[2], K[5], image_width, image_height, covar2d, mean2d);
+
+    float compensation;
+    float det = add_blur(eps2d, covar2d, compensation);
+    if(det <= 0.f)
+    {
+        radii[gid * 2]     = 0;
+        radii[gid * 2 + 1] = 0;
+        return;
+    }
+    mat2 covar2d_inv = glm::inverse(covar2d);
+
+    if(opacity < ALPHA_THRESHOLD)
+    {
+        radii[gid * 2]     = 0;
+        radii[gid * 2 + 1] = 0;
+        return;
+    }
+    const float extend = min(GAUSSIAN_EXTEND, sqrt(2.0f * __logf(opacity / ALPHA_THRESHOLD)));
+    float radius_x     = ceilf(extend * sqrtf(covar2d[0][0]));
+    float radius_y     = ceilf(extend * sqrtf(covar2d[1][1]));
+    if(radius_x <= 0.f && radius_y <= 0.f)
+    {
+        radii[gid * 2]     = 0;
+        radii[gid * 2 + 1] = 0;
+        return;
+    }
+    if(mean2d.x + radius_x <= 0 || mean2d.x - radius_x >= image_width || mean2d.y + radius_y <= 0
+       || mean2d.y - radius_y >= image_height)
+    {
+        radii[gid * 2]     = 0;
+        radii[gid * 2 + 1] = 0;
+        return;
+    }
+    radii[gid * 2]       = (int32_t)radius_x;
+    radii[gid * 2 + 1]   = (int32_t)radius_y;
+    means2d[gid * 2]     = mean2d.x;
+    means2d[gid * 2 + 1] = mean2d.y;
+    depths[gid]          = mean_c.z;
+    conics[gid * 3]      = covar2d_inv[0][0];
+    conics[gid * 3 + 1]  = covar2d_inv[0][1];
+    conics[gid * 3 + 2]  = covar2d_inv[1][1];
+}
+
+// Returns radii [1, N, 2], means2d [1, N, 2], depths [1, N], conics [1, N, 3],
+// opacities [N] (sigmoid of the logits).
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> projection_act_fwd(
+    const at::Tensor &means, const at::Tensor &quats, const at::Tensor &log_scales, const at::Tensor &logits,
+    const at::Tensor &viewmats, const at::Tensor &Ks, int64_t image_width, int64_t image_height, double eps2d,
+    double near_plane, double far_plane
+)
+{
+    DEVICE_GUARD(means);
+    for(auto t: {means, quats, log_scales, logits, viewmats, Ks})
+    {
+        CHECK_INPUT(t);
+        TORCH_CHECK(t.scalar_type() == at::kFloat, "projection_act_fwd expects float32");
+    }
+    const int64_t N = means.size(0);
+    TORCH_CHECK(means.numel() == 3 * N && quats.numel() == 4 * N && log_scales.numel() == 3 * N && logits.numel() == N,
+                "projection_act_fwd expects means [N,3], quats [N,4], scales [N,3], opacities [N]");
+    TORCH_CHECK(viewmats.numel() == 16 && Ks.numel() == 9, "projection_act_fwd supports one camera");
+    auto opt          = means.options();
+    at::Tensor radii  = at::empty({1, N, 2}, opt.dtype(at::kInt));
+    at::Tensor m2d    = at::empty({1, N, 2}, opt);
+    at::Tensor depths = at::empty({1, N}, opt);
+    at::Tensor conics = at::empty({1, N, 3}, opt);
+    at::Tensor opac   = at::empty({N}, opt);
+    if(N > 0)
+    {
+        constexpr unsigned threads = 256;
+        projection_act_fwd_kernel<<<static_cast<unsigned>((N + threads - 1) / threads), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            N, means.const_data_ptr<float>(), quats.const_data_ptr<float>(), log_scales.const_data_ptr<float>(),
+            logits.const_data_ptr<float>(), viewmats.const_data_ptr<float>(), Ks.const_data_ptr<float>(),
+            static_cast<uint32_t>(image_width), static_cast<uint32_t>(image_height), static_cast<float>(eps2d),
+            static_cast<float>(near_plane), static_cast<float>(far_plane), radii.data_ptr<int32_t>(),
+            m2d.data_ptr<float>(), depths.data_ptr<float>(), conics.data_ptr<float>(), opac.data_ptr<float>()
+        );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return {radii, m2d, depths, conics, opac};
+}
+
 TORCH_LIBRARY_IMPL(gsplat, CUDA, m)
 {
     m.impl("geometry_adam", &geometry_adam);
     m.impl("projection_geometry_adam", &projection_geometry_adam);
+    m.impl("projection_act_fwd", &projection_act_fwd);
 }
 } // namespace gsplat
