@@ -393,8 +393,9 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
 // gradient in registers, so the warp reduction, the global atomics and the
 // per-gaussian loop overhead are amortized over 64 pixels instead of 32.
 // Per-pixel math is identical to rasterize_to_pixels_3dgs_bwd_kernel.
+// 8 blocks/SM (<= 64 registers) was marginally faster than unconstrained.
 template<uint32_t CDIM, uint32_t PPT>
-__global__ void rasterize_to_pixels_3dgs_bwd_ppt_kernel(
+__global__ void __launch_bounds__(256 / PPT, 8) rasterize_to_pixels_3dgs_bwd_ppt_kernel(
     const uint32_t I,
     const int64_t n_isects,
     const vec2 *__restrict__ means2d,
