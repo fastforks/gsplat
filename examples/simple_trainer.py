@@ -485,6 +485,7 @@ class Runner:
         if cfg.lazy_sh_adam:
             assert not cfg.packed and cfg.camera_model == "pinhole" and not cfg.with_ut and not cfg.with_eval3d
             assert isinstance(cfg.strategy, DefaultStrategy), "lazy_sh_adam supports DefaultStrategy"
+            cfg.strategy.grad_hook = True  # no retain_grad copy of the 2D-means gradient
         if cfg.fused_shn_adam or cfg.fused_sh_colors or cfg.lazy_sh_adam:
             assert cfg.split_sh and not cfg.sh_fp16 and not cfg.app_opt, "fused_shn_adam requires split_sh"
             assert not cfg.visible_adam and not cfg.sparse_grad, "fused_shn_adam requires torch Adam"
@@ -784,7 +785,8 @@ class Runner:
             )
         mask = radii[..., 0] > 0  # culled gaussians have radii (0, 0), visible ones >= 1
         colors = self.lazy_sh.colors(sh_degree, means, viewmats, mask)  # [C, N, 3]
-        opac = opacities[None].expand(C, N)
+        # With one camera a plain view: expand's backward would copy the gradient.
+        opac = opacities[None] if C == 1 else opacities[None].expand(C, N)
         tile_width = math.ceil(width / float(tile_size))
         tile_height = math.ceil(height / float(tile_size))
         _, isect_ids, flatten_ids = isect_tiles(
