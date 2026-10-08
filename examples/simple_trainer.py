@@ -412,8 +412,9 @@ def create_splats_with_optimizers(
 
 
 class _DeviceCachedLoader:
-    """Iterates shuffled batches like DataLoader(shuffle=True, drop_last=False)
-    over dataset items that are all kept on `device`."""
+    """Iterates shuffled batches over dataset items that are all kept on
+    `device`, in exactly the order DataLoader(shuffle=True, drop_last=False,
+    persistent_workers=True) would produce from the same global RNG state."""
 
     def __init__(self, dataset, batch_size: int, device):
         items = [dataset[i] for i in range(len(dataset))]
@@ -422,9 +423,18 @@ class _DeviceCachedLoader:
         self.data = {
             k: [torch.as_tensor(item[k]).to(device) for item in items] for k in items[0]
         }
+        self._started = False
 
     def __iter__(self):
-        order = torch.randperm(self.n).tolist()
+        if not self._started:
+            # The DataLoader iterator draws its worker base seed once.
+            torch.empty((), dtype=torch.int64).random_()
+            self._started = True
+        # RandomSampler: per-epoch seed from the global RNG, then randperm.
+        seed = int(torch.empty((), dtype=torch.int64).random_().item())
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        order = torch.randperm(self.n, generator=generator).tolist()
         for i in range(0, self.n, self.batch_size):
             idx = order[i : i + self.batch_size]
             if len(idx) == 1:
