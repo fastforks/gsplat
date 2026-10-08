@@ -451,6 +451,7 @@ class Dataset:
         patch_size: Optional[int] = None,
         load_depths: bool = False,
         uint8_images: bool = False,
+        grey: bool = False,
     ):
         self.parser = parser
         self.split = split
@@ -459,6 +460,8 @@ class Dataset:
         # Return decoded images as uint8 (4x smaller host-to-device copy);
         # the caller converts to float on the device.
         self.uint8_images = uint8_images
+        # Convert decoded images to 1-channel luma (OpenCV RGB2GRAY, BT.601).
+        self.grey = grey
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
@@ -484,6 +487,8 @@ class Dataset:
             image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
             x, y, w, h = self.parser.roi_undist_dict[camera_id]
             image = image[y : y + h, x : x + w]
+        if self.grey:
+            image = cv2.cvtColor(np.ascontiguousarray(image), cv2.COLOR_RGB2GRAY)[..., None]
         return image
 
     def preload_images(self, num_workers: int = 4) -> None:

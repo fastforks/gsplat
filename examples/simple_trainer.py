@@ -159,6 +159,10 @@ class Config:
     # memory, instead of decoding one image per step (COLMAP data only). Costs
     # the decoded training set in host memory on every rank.
     cache_images: bool = False
+    # Train on 1-channel grey images (luma computed while loading).
+    grey: bool = False
+    # Evaluate an RGB model against grey ground truth (renders converted to luma).
+    eval_grey: bool = False
     # DataLoader worker processes decoding training images. Early in training
     # (few Gaussians) 4 workers cap a garden/4 run at ~130 steps/s.
     num_workers: int = 4
@@ -349,6 +353,7 @@ def create_splats_with_optimizers(
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
+    channels: int = 3,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm" or init_type == "lidar":
         points = torch.from_numpy(parser.points).float()
@@ -358,6 +363,11 @@ def create_splats_with_optimizers(
         rgbs = torch.rand((init_num_pts, 3))
     else:
         raise ValueError("Please specify a correct init_type: sfm, random, or lidar")
+
+    if channels == 1:
+        rgbs = (rgbs @ torch.tensor([0.299, 0.587, 0.114]))[:, None]  # luma, [N, 1]
+    else:
+        assert channels == 3, "channels must be 1 (grey) or 3 (RGB)"
 
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
@@ -383,7 +393,7 @@ def create_splats_with_optimizers(
 
     if feature_dim is None:
         # color is SH coefficients.
-        colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
+        colors = torch.zeros((N, (sh_degree + 1) ** 2, channels))  # [N, K, C]
         colors[:, 0, :] = rgb_to_sh(rgbs)
         params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
         params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
@@ -462,6 +472,8 @@ class Runner:
         set_random_seed(42 + local_rank)
 
         self.cfg = cfg
+        if cfg.grey:
+            assert not cfg.app_opt and cfg.post_processing is None, "grey training supports plain SH colors only"
         if cfg.fused_geometry_adam:
             assert cfg.opacity_reg == 0 and cfg.scale_reg == 0, "regularizers would bypass the fused step"
             assert not cfg.visible_adam and not cfg.sparse_grad and not cfg.app_opt
@@ -540,8 +552,9 @@ class Runner:
                 patch_size=cfg.patch_size,
                 load_depths=cfg.depth_loss,
                 uint8_images=True,
+                grey=cfg.grey,
             )
-            self.valset = Dataset(self.parser, split="val")
+            self.valset = Dataset(self.parser, split="val", grey=cfg.grey or cfg.eval_grey)
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -583,6 +596,7 @@ class Runner:
             feature_dim=feature_dim,
             device=self.device,
             world_rank=world_rank,
+            channels=1 if cfg.grey else 3,
             world_size=world_size,
         )
         self.scene = GaussianScene.from_splats(self.splats, id="scene")
@@ -1130,7 +1144,7 @@ class Runner:
                 colors, depths = renders, None
 
             if cfg.random_bkgd:
-                bkgd = torch.rand(1, 3, device=device)
+                bkgd = torch.rand(1, colors.shape[-1], device=device)
                 colors = colors + bkgd * (1.0 - alphas)
 
             # While Gaussians are frozen for PPISP controller distillation the render
@@ -1474,6 +1488,13 @@ class Runner:
             ellipse_time += max(time.time() - tic, 1e-10)
 
             colors = torch.clamp(colors, 0.0, 1.0)
+            if cfg.eval_grey and colors.shape[-1] == 3:
+                # Same BT.601 weights as OpenCV's RGB2GRAY used for the ground truth.
+                colors = (colors @ torch.tensor([0.299, 0.587, 0.114], device=device))[..., None]
+            if colors.shape[-1] == 1:
+                # LPIPS (and image writing) expect 3 channels; PSNR/SSIM are unchanged
+                # by repeating a single channel.
+                colors, pixels = colors.repeat(1, 1, 1, 3), pixels.repeat(1, 1, 1, 3)
             canvas_list = [pixels, colors]
 
             if world_rank == 0:
