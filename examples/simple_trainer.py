@@ -59,7 +59,9 @@ from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization, RasterizeMode
+from gsplat.cuda._wrapper import fully_fused_projection
 from gsplat.optimizers.fused_sh_adam import (
+    LazySHAdam,
     sh_colors_fused_adam,
     spherical_harmonics_l1_plus_fused_adam,
 )
@@ -179,6 +181,10 @@ class Config:
     # With split_sh: compute colors = max(SH(sh0, shN) + 0.5, 0) in one kernel and
     # apply both sh0's and shN's Adam steps inside its backward (exact).
     fused_sh_colors: bool = False
+    # With split_sh: like fused_sh_colors, but sh0/shN rows without color
+    # gradient skip their Adam step; the deferred zero-gradient steps are replayed
+    # bit-exactly when the row is next needed (see gsplat.optimizers.LazySHAdam).
+    lazy_sh_adam: bool = False
     # Turn on another SH degree every this steps
     sh_degree_interval: int = 1000
     # Initial opacity of GS
@@ -406,7 +412,10 @@ class Runner:
         set_random_seed(42 + local_rank)
 
         self.cfg = cfg
-        if cfg.fused_shn_adam or cfg.fused_sh_colors:
+        if cfg.lazy_sh_adam:
+            assert not cfg.packed and cfg.camera_model == "pinhole" and not cfg.with_ut and not cfg.with_eval3d
+            assert isinstance(cfg.strategy, DefaultStrategy), "lazy_sh_adam supports DefaultStrategy"
+        if cfg.fused_shn_adam or cfg.fused_sh_colors or cfg.lazy_sh_adam:
             assert cfg.split_sh and not cfg.sh_fp16 and not cfg.app_opt, "fused_shn_adam requires split_sh"
             assert not cfg.visible_adam and not cfg.sparse_grad, "fused_shn_adam requires torch Adam"
         self.world_rank = world_rank
@@ -524,6 +533,11 @@ class Runner:
             world_size=world_size,
         )
         self.scene = GaussianScene.from_splats(self.splats, id="scene")
+        self.lazy_sh = (
+            LazySHAdam(self.optimizers["sh0"], self.optimizers["shN"])
+            if cfg.lazy_sh_adam
+            else None
+        )
         self.splats = self.scene.splats
         self.stage = Stage()
         self.stage.add_scene(self.scene, self.rasterize_splats)
@@ -707,7 +721,21 @@ class Runner:
         elif self.cfg.split_sh and not self.cfg.sh_fp16:
             sh_degree = kwargs.pop("sh_degree", self.cfg.sh_degree)
             viewmats = torch.linalg.inv_ex(camtoworlds).inverse
-            if self.cfg.fused_sh_colors:
+            if self.lazy_sh is not None:
+                mask = None
+                if torch.is_grad_enabled():
+                    # Gaussians this step rasterizes (same projection as below);
+                    # only their SH rows need to be current in the forward.
+                    with torch.no_grad():
+                        radii = fully_fused_projection(
+                            means, None, quats, scales, viewmats, Ks, width, height,
+                            near_plane=kwargs.get("near_plane", 0.01),
+                            far_plane=kwargs.get("far_plane", 1e10),
+                            opacities=opacities,
+                        )[0]
+                        mask = (radii > 0).all(dim=-1)  # [C, N]
+                colors = self.lazy_sh.colors(sh_degree, means, viewmats, mask)  # [C, N, 3]
+            elif self.cfg.fused_sh_colors:
                 colors = sh_colors_fused_adam(
                     sh_degree,
                     means,
@@ -1098,6 +1126,8 @@ class Runner:
 
             # save checkpoint before updating the model
             if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
+                if self.lazy_sh is not None:
+                    self.lazy_sh.catch_up()
                 mem = torch.cuda.max_memory_allocated() / 1024**3
                 stats = {
                     "mem": mem,
@@ -1133,6 +1163,8 @@ class Runner:
             if (
                 step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
             ) and cfg.save_ply:
+                if self.lazy_sh is not None:
+                    self.lazy_sh.catch_up()
                 if self.cfg.app_opt:
                     # eval at origin to bake the appeareance into the colors
                     rgb = self.app_module(
@@ -1208,6 +1240,14 @@ class Runner:
             for scheduler in schedulers:
                 scheduler.step()
 
+            # Deferred SH Adam steps must be applied before densification edits
+            # the parameters and their optimizer state (refine/reset steps).
+            if (
+                self.lazy_sh is not None
+                and step % self.cfg.strategy.refine_every == 0
+            ):
+                self.lazy_sh.catch_up()
+
             # Run post-backward steps after backward and optimizer.
             # Skip structural updates while Gaussians are frozen for PPISP controller distillation.
             if self._gaussians_frozen:
@@ -1237,11 +1277,15 @@ class Runner:
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
+                if self.lazy_sh is not None:
+                    self.lazy_sh.catch_up()
                 self.eval(step)
                 self.render_traj(step)
 
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
+                if self.lazy_sh is not None:
+                    self.lazy_sh.catch_up()
                 self.run_compression(step=step)
 
             if not cfg.disable_viewer:
@@ -1256,6 +1300,9 @@ class Runner:
                 )
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
+
+        if self.lazy_sh is not None:
+            self.lazy_sh.catch_up()
 
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
