@@ -205,6 +205,9 @@ class Config:
     # Apply the Adam steps of means/quats/scales/opacities (with the exp/sigmoid
     # activation backward) in one fused kernel inside the backward pass.
     fused_geometry_adam: bool = False
+    # With fused_geometry_adam + lazy_sh_adam: the projection backward runs in
+    # the same kernel as the geometry Adam step (gradients stay in registers).
+    fused_projection_adam: bool = False
     # Compute the L1 and SSIM losses in one fused-ssim pass (same gradients).
     fused_l1_ssim: bool = False
     # Turn on another SH degree every this steps
@@ -477,6 +480,8 @@ class Runner:
         if cfg.fused_geometry_adam:
             assert cfg.opacity_reg == 0 and cfg.scale_reg == 0, "regularizers would bypass the fused step"
             assert not cfg.visible_adam and not cfg.sparse_grad and not cfg.app_opt
+        if cfg.fused_projection_adam:
+            assert cfg.fused_geometry_adam and cfg.lazy_sh_adam and not cfg.antialiased
         if cfg.lazy_sh_adam:
             assert not cfg.packed and cfg.camera_model == "pinhole" and not cfg.with_ut and not cfg.with_eval3d
             assert isinstance(cfg.strategy, DefaultStrategy), "lazy_sh_adam supports DefaultStrategy"
@@ -756,7 +761,8 @@ class Runner:
         print("[Distillation] Gaussian parameters frozen")
 
     def _render_lowlevel_lazy(
-        self, means, quats, scales, opacities, viewmats, Ks, width, height, sh_degree, near_plane, far_plane
+        self, means, quats, scales, opacities, viewmats, Ks, width, height, sh_degree, near_plane, far_plane,
+        raw_geometry=False,
     ):
         """Dense pinhole RGB rendering through the low-level ops so that a single
         projection provides both the visibility mask for LazySHAdam's forward and
@@ -764,10 +770,18 @@ class Runner:
         kernels as rasterization()."""
         C, N = viewmats.shape[0], means.shape[0]
         tile_size = 16
-        radii, means2d, depths, conics, _ = fully_fused_projection(
-            means, None, quats, scales, viewmats, Ks, width, height,
-            eps2d=0.3, near_plane=near_plane, far_plane=far_plane, opacities=opacities,
-        )
+        if raw_geometry:
+            # means/quats/scales/opacities are the raw parameters; activation,
+            # projection and their backward + Adam are fused (GeometryAdam.project).
+            means, opacities, radii, means2d, depths, conics = self.geo_adam.project(
+                means, quats, scales, opacities, viewmats, Ks, width, height,
+                eps2d=0.3, near_plane=near_plane, far_plane=far_plane,
+            )
+        else:
+            radii, means2d, depths, conics, _ = fully_fused_projection(
+                means, None, quats, scales, viewmats, Ks, width, height,
+                eps2d=0.3, near_plane=near_plane, far_plane=far_plane, opacities=opacities,
+            )
         mask = radii[..., 0] > 0  # culled gaussians have radii (0, 0), visible ones >= 1
         colors = self.lazy_sh.colors(sh_degree, means, viewmats, mask)  # [C, N, 3]
         opac = opacities[None].expand(C, N)
@@ -815,7 +829,22 @@ class Runner:
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         splats = splats if splats is not None else self.splats
-        if self.geo_adam is not None and splats is self.splats:
+        raw_geometry = (
+            self.cfg.fused_projection_adam
+            and self.geo_adam is not None
+            and splats is self.splats
+            and torch.is_grad_enabled()
+            and camtoworlds.shape[0] == 1
+            and kwargs.get("render_mode", "RGB") == "RGB"
+            and (rasterize_mode or "classic") == "classic"
+            and not hasattr(self, "ncore_camera_data")
+        )
+        if raw_geometry:
+            # Activation + projection happen in _render_lowlevel_lazy.
+            means, quats, scales, opacities = (
+                splats["means"], splats["quats"], splats["scales"], splats["opacities"]
+            )
+        elif self.geo_adam is not None and splats is self.splats:
             # Activations whose backward applies the geometry Adam steps directly.
             means, quats, scales, opacities = self.geo_adam.activate(
                 splats["means"], splats["quats"], splats["scales"], splats["opacities"]
@@ -855,6 +884,7 @@ class Runner:
                     render_colors, render_alphas, info = self._render_lowlevel_lazy(
                         means, quats, scales, opacities, viewmats, Ks, width, height,
                         sh_degree, kwargs.get("near_plane", 0.01), kwargs.get("far_plane", 1e10),
+                        raw_geometry=raw_geometry,
                     )
                     colors = None
                 else:
