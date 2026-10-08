@@ -54,7 +54,7 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
 
-from gsplat import export_splats
+from gsplat import export_splats, spherical_harmonics_l0, spherical_harmonics_l1_plus
 from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
@@ -165,6 +165,9 @@ class Config:
     # Cast SH coefficients to fp16 before feeding the SH kernel.
     # Parameters and Adam state stay fp32.
     sh_fp16: bool = False
+    # Evaluate SH from sh0 and shN separately instead of concatenating them
+    # into one [N, K, 3] tensor every step (avoids the cat and its backward copies).
+    split_sh: bool = False
     # Turn on another SH degree every this steps
     sh_degree_interval: int = 1000
     # Initial opacity of GS
@@ -686,6 +689,18 @@ class Runner:
             )
             colors = colors + splats["colors"]
             colors = torch.sigmoid(colors)
+        elif self.cfg.split_sh and not self.cfg.sh_fp16:
+            sh_degree = kwargs.pop("sh_degree", self.cfg.sh_degree)
+            colors = spherical_harmonics_l0(splats["sh0"])  # [N, 3]
+            if sh_degree > 0:
+                colors = colors + spherical_harmonics_l1_plus(
+                    sh_degree,
+                    means,
+                    torch.linalg.inv_ex(camtoworlds).inverse,
+                    splats["shN"],
+                )  # [C, N, 3]
+            colors = torch.clamp_min(colors + 0.5, 0.0)
+            colors = colors.expand(camtoworlds.shape[0], -1, -1)  # [C, N, 3]
         else:
             # Cast before the cat so both the cat and the SH kernel run on fp16.
             if self.cfg.sh_fp16:
