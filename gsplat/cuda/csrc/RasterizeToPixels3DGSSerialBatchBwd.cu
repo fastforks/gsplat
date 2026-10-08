@@ -399,7 +399,9 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
 // per-gaussian loop overhead are amortized over 64 pixels instead of 32.
 // Per-pixel math is identical to rasterize_to_pixels_3dgs_bwd_kernel.
 // 8 blocks/SM (<= 64 registers) was marginally faster than unconstrained.
-template<uint32_t CDIM, uint32_t PPT>
+// ABS: also accumulate |d means2d| (absgrad); without it the reduce-scatter
+// covers CDIM + 6 values instead of CDIM + 8.
+template<uint32_t CDIM, uint32_t PPT, bool ABS>
 __global__ void __launch_bounds__(256 / PPT, 8) rasterize_to_pixels_3dgs_bwd_ppt_kernel(
     const uint32_t I,
     const int64_t n_isects,
@@ -498,6 +500,10 @@ __global__ void __launch_bounds__(256 / PPT, 8) rasterize_to_pixels_3dgs_bwd_ppt
     __shared__ float4 pk0_batch[BLOCK];
     __shared__ float4 pk1_batch[BLOCK];
     __shared__ float rgbs_batch[BLOCK * CDIM];
+
+    constexpr int NV = CDIM + (ABS ? 8 : 6);
+    // value index this lane pair holds after the reduce-scatter (-1: none)
+    const int rs_c = reduce_scatter_index<NV>(lane);
 
     float bg_dot[PPT];
 #    pragma unroll
@@ -613,9 +619,12 @@ __global__ void __launch_bounds__(256 / PPT, 8) rasterize_to_pixels_3dgs_bwd_ppt
                     const float gy = v_sigma * (conic.y * dx + conic.z * dy);
                     vals[CDIM + 3] += gx;
                     vals[CDIM + 4] += gy;
-                    vals[CDIM + 5] += fabsf(gx);
-                    vals[CDIM + 6] += fabsf(gy);
-                    vals[CDIM + 7] += vis[p] * v_alpha;
+                    if constexpr(ABS)
+                    {
+                        vals[CDIM + 5] += fabsf(gx);
+                        vals[CDIM + 6] += fabsf(gy);
+                    }
+                    vals[NV - 1] += vis[p] * v_alpha;
                 }
 #    pragma unroll
                 for(uint32_t k = 0; k < CDIM; ++k)
@@ -623,24 +632,23 @@ __global__ void __launch_bounds__(256 / PPT, 8) rasterize_to_pixels_3dgs_bwd_ppt
                     buffer[p][k] += rgb_t[k] * fac;
                 }
             }
-            const float sum  = warpReduceScatter16(vals, lane);
-            const uint32_t c = lane >> 1;
-            if((lane & 1) == 0 && c < CDIM + 8)
+            const float sum = warpReduceScatterN<NV>(vals, lane);
+            if((lane & 1) == 0 && rs_c >= 0)
             {
-                const int32_t g = id_batch[t];
-                float *ptr      = nullptr;
+                const uint32_t c = static_cast<uint32_t>(rs_c);
+                const int32_t g  = id_batch[t];
+                float *ptr;
                 if(c < CDIM)
                     ptr = v_colors + CDIM * g + c;
                 else if(c < CDIM + 3)
                     ptr = (float *)(v_conics) + 3 * g + (c - CDIM);
                 else if(c < CDIM + 5)
                     ptr = (float *)(v_means2d) + 2 * g + (c - CDIM - 3);
-                else if(c < CDIM + 7)
-                    ptr = v_means2d_abs == nullptr ? nullptr : (float *)(v_means2d_abs) + 2 * g + (c - CDIM - 5);
+                else if(ABS && c < CDIM + 7)
+                    ptr = (float *)(v_means2d_abs) + 2 * g + (c - CDIM - 5);
                 else
                     ptr = v_opacities + g;
-                if(ptr != nullptr)
-                    atomicAdd_system(ptr, sum);
+                atomicAdd_system(ptr, sum);
             }
         }
     }
@@ -712,7 +720,9 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
         {
             if(tile_size == 16)
             {
-                rasterize_to_pixels_3dgs_bwd_ppt_kernel<CDIM, BWD_PPT>
+                auto launch_ppt = [&]<bool ABS>()
+                {
+                rasterize_to_pixels_3dgs_bwd_ppt_kernel<CDIM, BWD_PPT, ABS>
                     <<<n_tiles, 256 / BWD_PPT, 0, at::cuda::getCurrentCUDAStream()>>>(
                         I,
                         n_isects,
@@ -739,6 +749,11 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
                         v_colors.data_ptr<float>(),
                         v_opacities.data_ptr<float>()
                     );
+                };
+                if(v_means2d_abs.has_value())
+                    launch_ppt.template operator()<true>();
+                else
+                    launch_ppt.template operator()<false>();
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
                 return;
             }
