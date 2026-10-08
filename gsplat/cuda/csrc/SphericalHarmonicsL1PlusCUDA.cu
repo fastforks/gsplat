@@ -1677,20 +1677,20 @@ __global__ void sh_colors_lazy_bwd_adam_kernel(
 {
     extern __shared__ float lazy_smem[];
     const uint32_t KD = K * D;
-    float *p_slab     = lazy_smem;                                                 // caught-up shN
-    float *grad_slab  = p_slab + rows_per_block * KD;                              // shN gradient
-    int *active       = reinterpret_cast<int *>(grad_slab + rows_per_block * KD); // [rows_per_block]
-    int *row_from     = active + rows_per_block;                                   // [rows_per_block]
+    float *p_slab     = lazy_smem;                                                 // caught-up shN, by active slot
+    float *grad_slab  = p_slab + rows_per_block * KD;                              // shN gradient, by active slot
+    int *active       = reinterpret_cast<int *>(grad_slab + rows_per_block * KD); // [rows_per_block] flags
+    int *active_list  = active + rows_per_block;                                   // [rows_per_block] local rows
+    int *row_from     = active_list + rows_per_block;                              // [rows_per_block] by slot
+    int *n_active_sm  = row_from + rows_per_block;                                 // [1 + warps] counters
 
     const uint32_t tid      = threadIdx.x;
+    // Row sweeps use whole warps only (lanes stride along a row); blockDim.x
+    // need not be a multiple of 32.
+    const uint32_t lane = tid % 32, warp_id = tid / 32, n_warps = blockDim.x / 32;
     const int64_t row_begin = static_cast<int64_t>(blockIdx.x) * rows_per_block;
     const uint32_t rows     = static_cast<uint32_t>(N - row_begin < rows_per_block ? N - row_begin : rows_per_block);
-    const uint32_t local    = tid / D;
-    const uint32_t c        = tid % D;
-    const int64_t row       = row_begin + local;
     const int to            = step - 1;
-    const uint32_t slab     = rows * KD;
-    const int64_t base      = row_begin * KD;
 
     if(tid < rows_per_block)
     {
@@ -1698,49 +1698,76 @@ __global__ void sh_colors_lazy_bwd_adam_kernel(
     }
     __syncthreads();
     // A row is updated this step iff any of its color gradients is nonzero;
-    // otherwise its (zero-gradient) update is deferred.
-    if(local < rows)
+    // otherwise its (zero-gradient) update is deferred. Coalesced over the
+    // block's [rows, D] gradient slab.
+    for(uint32_t e = tid; e < rows * D; e += blockDim.x)
     {
         bool any = false;
         for(uint32_t image_id = 0; image_id < BC; ++image_id)
         {
-            any |= v_colors[(static_cast<int64_t>(image_id) * N + row) * D + c] != 0.f;
+            any |= v_colors[(static_cast<int64_t>(image_id) * N + row_begin) * D + e] != 0.f;
         }
         if(any)
         {
-            active[local] = 1;
+            active[e / D] = 1;
         }
-        if(c == 0)
+    }
+    __syncthreads();
+    // Compact the active rows of this block (order preserved).
+    if(warp_id == 0)
+    {
+        int count = 0;
+        for(uint32_t base_row = 0; base_row < rows; base_row += 32)
         {
-            row_from[local] = last[row];
+            const uint32_t r   = base_row + lane;
+            const bool f       = r < rows && active[r];
+            const unsigned bal = __ballot_sync(0xffffffffu, f);
+            if(f)
+            {
+                const int slot     = count + __popc(bal & ((1u << lane) - 1u));
+                active_list[slot]  = static_cast<int>(r);
+                row_from[slot]     = last[row_begin + r];
+            }
+            count += __popc(bal);
+        }
+        if(lane == 0)
+        {
+            n_active_sm[0] = count;
+        }
+    }
+    __syncthreads();
+    const int n_active = n_active_sm[0];
+    if(n_active == 0)
+    {
+        return;
+    }
+
+    // Stage caught-up shN of active rows: one warp per row, lanes along the row.
+    for(int a = warp_id; warp_id < n_warps && a < n_active; a += n_warps)
+    {
+        const int64_t base = (row_begin + active_list[a]) * KD;
+        const int from     = row_from[a];
+        for(uint32_t k = lane; k < KD; k += 32)
+        {
+            float p = shN[base + k];
+            if(from < to)
+            {
+                float m = shN_m[base + k], v = shN_v[base + k];
+                lazy_adam_replay(p, m, v, cN, from, to, zero);
+            }
+            p_slab[a * KD + k] = p;
         }
     }
     __syncthreads();
 
-    // Stage caught-up shN of active rows (coalesced).
-    for(uint32_t e = tid; e < slab; e += blockDim.x)
+    // Per (active row, channel) gradient math on contiguous threads.
+    if(tid < static_cast<uint32_t>(n_active) * D)
     {
-        const uint32_t lr = e / KD;
-        if(!active[lr])
-        {
-            continue;
-        }
-        const int64_t i = base + e;
-        float p         = shN[i];
-        if(row_from[lr] < to)
-        {
-            float m = shN_m[i], v = shN_v[i];
-            lazy_adam_replay(p, m, v, cN, row_from[lr], to, zero);
-        }
-        p_slab[e] = p;
-    }
-    __syncthreads();
-
-    const bool is_active = local < rows && active[local];
-    if(is_active)
-    {
-        const int from = row_from[local];
-        constexpr int MAX_K = (DEGREE + 1) * (DEGREE + 1) - 1;
+        const int a          = tid / D;
+        const uint32_t c     = tid % D;
+        const int64_t row    = row_begin + active_list[a];
+        const int from       = row_from[a];
+        constexpr int MAX_K  = (DEGREE + 1) * (DEGREE + 1) - 1;
         float acc[MAX_K > 0 ? MAX_K : 1];
 #pragma unroll
         for(int k = 0; k < (MAX_K > 0 ? MAX_K : 1); ++k)
@@ -1749,7 +1776,7 @@ __global__ void sh_colors_lazy_bwd_adam_kernel(
         }
         float s0 = sh0[row * D + c], s0_m = sh0_m[row * D + c], s0_v = sh0_v[row * D + c];
         lazy_adam_replay(s0, s0_m, s0_v, c0, from, to, zero);
-        const float *ce = p_slab + local * KD;
+        const float *ce = p_slab + a * KD;
         float v_sh0     = 0.f;
         for(uint32_t image_id = 0; image_id < BC; ++image_id)
         {
@@ -1795,11 +1822,11 @@ __global__ void sh_colors_lazy_bwd_adam_kernel(
         for(int k = 0; k < MAX_K; ++k)
         {
             if(static_cast<uint32_t>(k) < K)
-                grad_slab[local * KD + k * D + c] = acc[k];
+                grad_slab[a * KD + k * D + c] = acc[k];
         }
         for(uint32_t k = MAX_K; k < K; ++k)
         {
-            grad_slab[local * KD + k * D + c] = 0.f;
+            grad_slab[a * KD + k * D + c] = 0.f;
         }
         lazy_adam_update(v_sh0, s0, s0_m, s0_v, c0, step);
         sh0[row * D + c]   = s0;
@@ -1808,26 +1835,25 @@ __global__ void sh_colors_lazy_bwd_adam_kernel(
     }
     __syncthreads();
 
-    // shN update of active rows (coalesced). p comes caught-up from shared
-    // memory; the moments are re-read and replayed.
-    for(uint32_t e = tid; e < slab; e += blockDim.x)
+    // shN update of active rows: one warp per row. p comes caught-up from
+    // shared memory; the moments are re-read and replayed.
+    for(int a = warp_id; warp_id < n_warps && a < n_active; a += n_warps)
     {
-        const uint32_t lr = e / KD;
-        if(!active[lr])
+        const int64_t base = (row_begin + active_list[a]) * KD;
+        const int from     = row_from[a];
+        for(uint32_t k = lane; k < KD; k += 32)
         {
-            continue;
+            float p = p_slab[a * KD + k], m = shN_m[base + k], v = shN_v[base + k];
+            lazy_adam_replay_mv(m, v, cN, from, to, zero);
+            lazy_adam_update(grad_slab[a * KD + k], p, m, v, cN, step);
+            shN[base + k]   = p;
+            shN_m[base + k] = m;
+            shN_v[base + k] = v;
         }
-        const int64_t i = base + e;
-        float p = p_slab[e], m = shN_m[i], v = shN_v[i];
-        lazy_adam_replay_mv(m, v, cN, row_from[lr], to, zero);
-        lazy_adam_update(grad_slab[e], p, m, v, cN, step);
-        shN[i]   = p;
-        shN_m[i] = m;
-        shN_v[i] = v;
     }
-    if(tid < rows && active[tid])
+    if(tid < static_cast<uint32_t>(n_active))
     {
-        last[row_begin + tid] = step;
+        last[row_begin + active_list[tid]] = step;
     }
 }
 
@@ -1979,7 +2005,8 @@ void launch_sh_colors_lazy_bwd_adam_kernel(
     const uint32_t rows_per_block = 256 / D >= 4 ? (256 / D) / 4 * 4 : 256 / D;
     const unsigned int threads    = rows_per_block * D;
     const unsigned int blocks     = (N + rows_per_block - 1) / rows_per_block;
-    const size_t shmem = 2 * static_cast<size_t>(rows_per_block) * K * D * sizeof(float) + 2 * rows_per_block * sizeof(int);
+    const size_t shmem = 2 * static_cast<size_t>(rows_per_block) * K * D * sizeof(float)
+                       + (3 * rows_per_block + 1 + 32) * sizeof(int);
     auto stream        = at::cuda::getCurrentCUDAStream();
     const bool dispatched = dispatch::dispatch(
         dispatch::IntParam<0, 1, 2, 3>{static_cast<int>(degrees_to_use)},
