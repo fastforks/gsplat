@@ -134,7 +134,24 @@ void launch_spherical_harmonics_l1_plus_bwd_adam_kernel(
     const float beta1,
     const float beta2,
     const float eps,
-    const float bias_correction2_sqrt
+    const float bias_correction2_sqrt,
+    at::optional<at::Tensor> sh0,
+    at::optional<at::Tensor> sh0_exp_avg,
+    at::optional<at::Tensor> sh0_exp_avg_sq,
+    const float sh0_step_size,
+    const float sh0_beta1,
+    const float sh0_beta2,
+    const float sh0_eps,
+    const float sh0_bias_correction2_sqrt
+);
+
+void launch_sh_colors_fused_fwd_kernel(
+    const uint32_t degrees_to_use,
+    const at::Tensor means,
+    const at::Tensor viewmats,
+    const at::Tensor sh0,
+    const at::Tensor coeffs,
+    at::Tensor colors
 );
 
 void launch_spherical_harmonics_l1_plus_bwd_kernel(

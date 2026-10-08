@@ -1111,7 +1111,16 @@ void launch_spherical_harmonics_l1_plus_bwd_kernels(
 // decay, no amsgrad) to the parameter and both moments in place, so the shN
 // gradient is never written to memory. Rows with zero gradient are still
 // updated, exactly as torch.optim.Adam does.
-template<int DEGREE>
+// SH_C0 * sh0, as in spherical_harmonics_l0.
+constexpr float SH_L0_C0 = 0.2820947917738781f;
+// Max channels for the fused color path (per-thread scratch indexed by channel).
+constexpr uint32_t SH_FUSED_MAX_D = 4;
+
+// COLORS = true: the forward was sh_colors_fused_fwd, i.e.
+//   colors = max(C0 * sh0 + l1plus(shN) + 0.5, 0)
+// so the color gradient is masked where the pre-activation is negative
+// (recomputed exactly), and sh0 also gets its gradient and Adam step here.
+template<int DEGREE, bool COLORS>
 __global__ void spherical_harmonics_l1_plus_bwd_adam_kernel(
     const uint32_t BC,
     const uint32_t N,
@@ -1129,7 +1138,16 @@ __global__ void spherical_harmonics_l1_plus_bwd_adam_kernel(
     const float beta1,
     const float beta2,
     const float eps,
-    const float bias_correction2_sqrt
+    const float bias_correction2_sqrt,
+    // COLORS only: sh0 [N, 1, D] and its Adam state / hyper-parameters
+    float *__restrict__ sh0,
+    float *__restrict__ sh0_exp_avg,
+    float *__restrict__ sh0_exp_avg_sq,
+    const float sh0_step_size,
+    const float sh0_beta1,
+    const float sh0_beta2,
+    const float sh0_eps,
+    const float sh0_bias_correction2_sqrt
 )
 {
     // Phase 1: one thread per (gaussian, channel) computes that column's shN
@@ -1152,21 +1170,49 @@ __global__ void spherical_harmonics_l1_plus_bwd_adam_kernel(
         acc[k] = 0.f;
     }
 
+    float v_sh0 = 0.f; // COLORS only
     if(local < rows)
     {
-        if constexpr(DEGREE > 0)
+        if constexpr(DEGREE > 0 || COLORS)
         {
             const float *coeffs_ptr = coeffs + coeff_id * K * D;
             for(uint32_t image_id = 0; image_id < BC; ++image_id)
             {
                 const int64_t output_id = static_cast<int64_t>(image_id) * N + coeff_id;
                 vec3 v_dir              = {0.f, 0.f, 0.f};
-                if(v_colors[output_id * D + c] != 0.f)
+                float vc                = v_colors[output_id * D + c];
+                if(vc != 0.f)
                 {
                     const vec3 dir = view_direction_from_camera_data(means + coeff_id * 3, viewmats, nullptr, image_id);
-                    sh_l1_plus_coeffs_to_color_fast_vjp<float>(
-                        DEGREE, D, c, dir, coeffs_ptr, v_colors + output_id * D, acc, v_means == nullptr ? nullptr : &v_dir
-                    );
+                    if constexpr(COLORS)
+                    {
+                        // Recompute the pre-activation exactly as the forward did.
+                        // torch's clamp_min backward passes the gradient only where
+                        // x > 0 (zero at x == 0, which trained models hit often).
+                        float l1[SH_FUSED_MAX_D];
+                        l1[c] = 0.f;
+                        if constexpr(DEGREE > 0)
+                        {
+                            sh_l1_plus_coeffs_to_color_fast<float>(DEGREE, D, c, dir, coeffs_ptr, l1);
+                        }
+                        const float x = (sh0[coeff_id * D + c] * SH_L0_C0 + l1[c]) + 0.5f;
+                        if(!(x > 0.f))
+                        {
+                            vc = 0.f;
+                        }
+                        v_sh0 += vc * SH_L0_C0;
+                    }
+                    if constexpr(DEGREE > 0)
+                    {
+                        if(vc != 0.f)
+                        {
+                            float vloc[SH_FUSED_MAX_D];
+                            vloc[c] = vc;
+                            sh_l1_plus_coeffs_to_color_fast_vjp<float>(
+                                DEGREE, D, c, dir, coeffs_ptr, vloc, acc, v_means == nullptr ? nullptr : &v_dir
+                            );
+                        }
+                    }
                 }
                 if(v_means != nullptr && reduce_view_direction_channels(coeff_id, v_dir))
                 {
@@ -1234,6 +1280,100 @@ __global__ void spherical_harmonics_l1_plus_bwd_adam_kernel(
             exp_avg_sq[i] = v;
         }
     }
+
+    if constexpr(COLORS)
+    {
+        // sh0 is [N, 1, D]: element (coeff_id, c) is owned by this thread and
+        // consecutive threads touch consecutive floats.
+        if(local < rows)
+        {
+            const int64_t i = coeff_id * D + c;
+            float m         = sh0_beta1 * sh0_exp_avg[i] + (1.f - sh0_beta1) * v_sh0;
+            float v         = sh0_beta2 * sh0_exp_avg_sq[i] + (1.f - sh0_beta2) * v_sh0 * v_sh0;
+            float den       = sqrtf(v) / sh0_bias_correction2_sqrt + sh0_eps;
+            sh0[i]         -= sh0_step_size * m / den;
+            sh0_exp_avg[i]    = m;
+            sh0_exp_avg_sq[i] = v;
+        }
+    }
+}
+
+// colors = max(C0 * sh0 + l1plus(shN) + 0.5, 0), dense [BC, N, D]. Same
+// operation order as spherical_harmonics_l0 + spherical_harmonics_l1_plus
+// followed by (+ 0.5).clamp_min(0), so the result is bitwise identical.
+template<int DEGREE>
+__global__ void sh_colors_fused_fwd_kernel(
+    const uint32_t BC,
+    const uint32_t N,
+    const uint32_t K,
+    const uint32_t D,
+    const float *__restrict__ means,
+    const float *__restrict__ viewmats,
+    const float *__restrict__ sh0,    // [N, 1, D]
+    const float *__restrict__ coeffs, // [N, K, D]
+    float *__restrict__ colors        // [BC, N, D]
+)
+{
+    const int64_t idx = cg::this_grid().thread_rank();
+    if(idx >= static_cast<int64_t>(BC) * N * D)
+    {
+        return;
+    }
+    const uint32_t c        = static_cast<uint32_t>(idx % D);
+    const int64_t output_id = idx / D;
+    const uint32_t image_id = static_cast<uint32_t>(output_id / N);
+    const int64_t coeff_id  = output_id % N;
+    float l1[SH_FUSED_MAX_D];
+    l1[c] = 0.f;
+    if constexpr(DEGREE > 0)
+    {
+        const vec3 dir = view_direction_from_camera_data(means + coeff_id * 3, viewmats, nullptr, image_id);
+        sh_l1_plus_coeffs_to_color_fast<float>(DEGREE, D, c, dir, coeffs + coeff_id * K * D, l1);
+    }
+    const float x = (sh0[coeff_id * D + c] * SH_L0_C0 + l1[c]) + 0.5f;
+    colors[idx]   = x < 0.f ? 0.f : x;
+}
+
+void launch_sh_colors_fused_fwd_kernel(
+    const uint32_t degrees_to_use,
+    const at::Tensor means,
+    const at::Tensor viewmats,
+    const at::Tensor sh0,
+    const at::Tensor coeffs,
+    at::Tensor colors
+)
+{
+    const uint32_t D  = coeffs.size(-1);
+    const uint32_t K  = coeffs.size(-2);
+    const uint32_t N  = coeffs.size(0);
+    const uint32_t BC = viewmats.numel() / 16;
+    const int64_t n   = static_cast<int64_t>(BC) * N * D;
+    if(n == 0)
+    {
+        return;
+    }
+    constexpr unsigned int threads = 256;
+    const unsigned int blocks      = static_cast<unsigned int>(::cuda::ceil_div<int64_t>(n, threads));
+    auto stream                    = at::cuda::getCurrentCUDAStream();
+    const bool dispatched          = dispatch::dispatch(
+        dispatch::IntParam<0, 1, 2, 3>{static_cast<int>(degrees_to_use)},
+        [&]<typename DegConst>()
+        {
+            sh_colors_fused_fwd_kernel<DegConst::value><<<blocks, threads, 0, stream>>>(
+                BC,
+                N,
+                K,
+                D,
+                means.const_data_ptr<float>(),
+                viewmats.const_data_ptr<float>(),
+                sh0.const_data_ptr<float>(),
+                coeffs.const_data_ptr<float>(),
+                colors.data_ptr<float>()
+            );
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
+    );
+    TORCH_CHECK(dispatched, "Unsupported SH degree: ", degrees_to_use);
 }
 
 void launch_spherical_harmonics_l1_plus_bwd_adam_kernel(
@@ -1249,13 +1389,23 @@ void launch_spherical_harmonics_l1_plus_bwd_adam_kernel(
     const float beta1,
     const float beta2,
     const float eps,
-    const float bias_correction2_sqrt
+    const float bias_correction2_sqrt,
+    at::optional<at::Tensor> sh0,
+    at::optional<at::Tensor> sh0_exp_avg,
+    at::optional<at::Tensor> sh0_exp_avg_sq,
+    const float sh0_step_size,
+    const float sh0_beta1,
+    const float sh0_beta2,
+    const float sh0_eps,
+    const float sh0_bias_correction2_sqrt
 )
 {
     const uint32_t D  = coeffs.size(-1);
     const uint32_t K  = coeffs.size(-2);
     const uint32_t N  = coeffs.size(0);
     const uint32_t BC = viewmats.numel() / 16;
+    const bool colors_mode = sh0.has_value();
+    TORCH_CHECK(!colors_mode || D <= SH_FUSED_MAX_D, "fused SH colors support up to ", SH_FUSED_MAX_D, " channels");
     if(N == 0)
     {
         return;
@@ -1272,15 +1422,15 @@ void launch_spherical_harmonics_l1_plus_bwd_adam_kernel(
         [&]<typename DegConst>()
         {
             constexpr int DEGREE = DegConst::value;
+            auto kernel          = colors_mode ? spherical_harmonics_l1_plus_bwd_adam_kernel<DEGREE, true>
+                                               : spherical_harmonics_l1_plus_bwd_adam_kernel<DEGREE, false>;
             if(shmem > 48 * 1024)
             {
-                C10_CUDA_CHECK(cudaFuncSetAttribute(
-                    spherical_harmonics_l1_plus_bwd_adam_kernel<DEGREE>,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                    static_cast<int>(shmem)
-                ));
+                C10_CUDA_CHECK(
+                    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shmem))
+                );
             }
-            spherical_harmonics_l1_plus_bwd_adam_kernel<DEGREE><<<blocks, threads, shmem, stream>>>(
+            kernel<<<blocks, threads, shmem, stream>>>(
                 BC,
                 N,
                 K,
@@ -1297,7 +1447,15 @@ void launch_spherical_harmonics_l1_plus_bwd_adam_kernel(
                 beta1,
                 beta2,
                 eps,
-                bias_correction2_sqrt
+                bias_correction2_sqrt,
+                colors_mode ? sh0.value().data_ptr<float>() : nullptr,
+                colors_mode ? sh0_exp_avg.value().data_ptr<float>() : nullptr,
+                colors_mode ? sh0_exp_avg_sq.value().data_ptr<float>() : nullptr,
+                sh0_step_size,
+                sh0_beta1,
+                sh0_beta2,
+                sh0_eps,
+                sh0_bias_correction2_sqrt
             );
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
