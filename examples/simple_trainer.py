@@ -66,6 +66,10 @@ from gsplat.cuda._wrapper import (
     rasterize_to_pixels,
 )
 from gsplat.optimizers.geometry_adam import GeometryAdam
+try:
+    from fused_ssim import fused_l1_ssim
+except ImportError:  # older fused-ssim
+    fused_l1_ssim = None
 from gsplat.optimizers.fused_sh_adam import (
     LazySHAdam,
     sh_colors_fused_adam,
@@ -197,6 +201,8 @@ class Config:
     # Apply the Adam steps of means/quats/scales/opacities (with the exp/sigmoid
     # activation backward) in one fused kernel inside the backward pass.
     fused_geometry_adam: bool = False
+    # Compute the L1 and SSIM losses in one fused-ssim pass (same gradients).
+    fused_l1_ssim: bool = False
     # Turn on another SH degree every this steps
     sh_degree_interval: int = 1000
     # Initial opacity of GS
@@ -1148,12 +1154,21 @@ class Runner:
                 colors_ssim = colors * masks[..., None]
                 pixels_ssim = pixels * masks[..., None]
             else:
-                l1loss = l1_loss(colors, pixels).mean()
+                l1loss = None
+                if not self.cfg.fused_l1_ssim:
+                    l1loss = l1_loss(colors, pixels).mean()
                 colors_ssim = colors
                 pixels_ssim = pixels
-            ssimloss = ssim_loss(
-                colors_ssim.permute(0, 3, 1, 2), pixels_ssim.permute(0, 3, 1, 2)
-            )
+            if l1loss is None:
+                # L1 and SSIM in one pass over the images; same gradients.
+                l1loss, ssim_val = fused_l1_ssim(
+                    colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+                )
+                ssimloss = 1.0 - ssim_val
+            else:
+                ssimloss = ssim_loss(
+                    colors_ssim.permute(0, 3, 1, 2), pixels_ssim.permute(0, 3, 1, 2)
+                )
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
             if cfg.depth_loss:
                 # query depths from depth map
