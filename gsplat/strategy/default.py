@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Tuple, Union
 
 import torch
+
+from ..cuda._wrapper import _make_lazy_cuda_func
 from typing_extensions import Literal
 
 from .base import Strategy
@@ -242,11 +244,11 @@ class DefaultStrategy(Strategy):
 
         # normalize grads to [-1, 1] screen space
         if self.absgrad:
-            grads = info[self.key_for_gradient].absgrad.clone()
+            grads = info[self.key_for_gradient].absgrad
         else:
-            grads = info[self.key_for_gradient].grad.clone()
-        grads[..., 0] *= info["width"] / 2.0 * info["n_cameras"]
-        grads[..., 1] *= info["height"] / 2.0 * info["n_cameras"]
+            grads = info[self.key_for_gradient].grad
+        sx = info["width"] / 2.0 * info["n_cameras"]
+        sy = info["height"] / 2.0 * info["n_cameras"]
 
         # initialize state on the first run
         n_gaussian = len(list(params.values())[0])
@@ -260,6 +262,27 @@ class DefaultStrategy(Strategy):
             state["radii"] = torch.zeros(n_gaussian, device=grads.device)
 
         # update the running state
+        if (
+            not packed
+            and self.refine_scale2d_stop_iter == 0  # the fused op does not track radii
+            and grads.is_cuda
+            and grads.dim() == 3
+            and grads.dtype == torch.float32
+            and info["radii"].dtype == torch.int32
+        ):
+            # One fused pass; same values as the dense tensor-op path below.
+            _make_lazy_cuda_func("strategy_update_state")(
+                grads.contiguous(),
+                info["radii"].contiguous(),
+                sx,
+                sy,
+                state["grad2d"],
+                state["count"],
+            )
+            return
+        grads = grads.clone()
+        grads[..., 0] *= sx
+        grads[..., 1] *= sy
         if packed:
             # grads is [nnz, 2]
             gs_ids = info["gaussian_ids"]  # [nnz]

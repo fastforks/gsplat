@@ -1021,6 +1021,9 @@ TORCH_LIBRARY(gsplat, m)
         "sh_lazy_catchup(Tensor(a!) p, Tensor(b!) m, Tensor(c!) v, Tensor last, int step, Tensor step_size_tab, "
         "Tensor bc2_sqrt_tab, float beta1, float beta2, float eps) -> ()"
     );
+    m.def(
+        "strategy_update_state(Tensor grads, Tensor radii, float sx, float sy, Tensor(a!) grad2d, Tensor(b!) count) -> ()"
+    );
     m.def("sh_colors_fused_fwd(int degrees_to_use, Tensor means, Tensor viewmats, Tensor sh0, Tensor shN) -> Tensor");
     m.def(
         "sh_colors_fused_bwd_adam(int degrees_to_use, Tensor means, Tensor viewmats, Tensor(a!) sh0, Tensor(b!) shN, "
