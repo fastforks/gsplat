@@ -121,8 +121,22 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
 
     uint32_t image_id = block_index.x;
     uint32_t tile_id  = block_index.y * tile_width + block_index.z;
-    uint32_t i        = block_index.y * tile_size + block.thread_index().y;
-    uint32_t j        = block_index.z * tile_size + block.thread_index().x;
+    // Map each warp to an 8x4 pixel patch of a 16x16 tile instead of a 16x2
+    // strip: gaussians are small and roughly isotropic, so a squarer patch
+    // reduces the (warp, gaussian) pairs that need the gradient reduction and
+    // raises the number of contributing lanes in each. Every pixel still has
+    // one thread.
+    uint32_t lx = block.thread_index().x, ly = block.thread_index().y;
+    if(tile_size == 16)
+    {
+        constexpr uint32_t WW = 8, WH = 32 / WW;
+        const uint32_t r      = block.thread_rank();
+        const uint32_t w      = r / 32, lane = r % 32;
+        lx                    = (w % (16 / WW)) * WW + lane % WW;
+        ly                    = (w / (16 / WW)) * WH + lane / WW;
+    }
+    uint32_t i = block_index.y * tile_size + ly;
+    uint32_t j = block_index.z * tile_size + lx;
 
     tile_offsets    += image_id * tile_height * tile_width;
     render_alphas   += image_id * image_height * image_width;
