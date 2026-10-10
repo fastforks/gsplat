@@ -1668,7 +1668,8 @@ __global__ void sh_colors_lazy_bwd_adam_kernel(
     const uint32_t rows_per_block,
     const float *__restrict__ means,
     const float *__restrict__ viewmats,
-    const float *__restrict__ v_colors, // [BC, N, D]
+    const float *__restrict__ v_colors, // [BC, N, D], rows vcs apart
+    const int64_t vcs,
     float *__restrict__ sh0,
     float *__restrict__ sh0_m,
     float *__restrict__ sh0_v,
@@ -1713,7 +1714,7 @@ __global__ void sh_colors_lazy_bwd_adam_kernel(
         bool any = false;
         for(uint32_t image_id = 0; image_id < BC; ++image_id)
         {
-            any |= v_colors[(static_cast<int64_t>(image_id) * N + row_begin) * D + e] != 0.f;
+            any |= v_colors[(static_cast<int64_t>(image_id) * N + row_begin + e / D) * vcs + e % D] != 0.f;
         }
         if(any)
         {
@@ -1823,7 +1824,7 @@ __global__ void sh_colors_lazy_bwd_adam_kernel(
         {
             const int64_t output_id = static_cast<int64_t>(image_id) * N + row;
             vec3 v_dir              = {0.f, 0.f, 0.f};
-            float vc                = v_colors[output_id * D + c];
+            float vc                = v_colors[output_id * vcs + c];
             if(vc != 0.f)
             {
                 const vec3 dir = view_direction_from_camera_data(means + row * 3, viewmats, nullptr, image_id);
@@ -2084,6 +2085,7 @@ void launch_sh_colors_lazy_bwd_adam_kernel(
                 means.const_data_ptr<float>(),
                 viewmats.const_data_ptr<float>(),
                 v_colors.const_data_ptr<float>(),
+                v_colors.stride(-2),
                 sh0.data_ptr<float>(),
                 sh0_m.data_ptr<float>(),
                 sh0_v.data_ptr<float>(),

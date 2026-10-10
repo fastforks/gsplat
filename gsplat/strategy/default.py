@@ -285,7 +285,7 @@ class DefaultStrategy(Strategy):
         ):
             # One fused pass; same values as the dense tensor-op path below.
             _make_lazy_cuda_func("strategy_update_state")(
-                grads.contiguous(),
+                grads if grads.stride(-1) == 1 else grads.contiguous(),  # row-strided view OK
                 info["radii"].contiguous(),
                 sx,
                 sy,

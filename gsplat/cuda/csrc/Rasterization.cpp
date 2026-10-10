@@ -528,14 +528,39 @@ RasterizeToPixels3DGSBwdResult rasterize_to_pixels_3dgs_bwd(
         CHECK_INPUT(masks.value());
     }
 
-    at::Tensor v_means2d   = at::zeros_like(means2d);
-    at::Tensor v_conics    = at::zeros_like(conics);
-    at::Tensor v_colors    = at::zeros_like(colors);
-    at::Tensor v_opacities = at::zeros_like(opacities);
-    at::Tensor v_means2d_abs;
-    if(absgrad)
+    at::Tensor v_means2d, v_conics, v_colors, v_opacities, v_means2d_abs;
+    const int64_t cdim = colors.size(-1);
+    // The 16x16 multi-pixel backward kernel (CDIM <= 8) accepts row-strided
+    // outputs: give it one zero-filled [..., N, S] buffer and return views, so a
+    // gaussian's gradients are adjacent in memory (fewer atomic sectors, one
+    // fill instead of four).
+    if(tile_size == 16 && cdim + 8 <= 16)
     {
-        v_means2d_abs = at::zeros_like(means2d);
+        const int64_t nv = cdim + 6 + (absgrad ? 2 : 0);
+        // Rows are unpadded (stride nv): padding to a sector multiple costs more
+        // zero-fill than it saves.
+        auto sizes = opacities.sizes().vec(); // [..., N] or [nnz]
+        sizes.push_back(nv);
+        at::Tensor g = at::zeros(sizes, opacities.options());
+        v_colors     = g.narrow(-1, 0, cdim);
+        v_conics     = g.narrow(-1, cdim, 3);
+        v_means2d    = g.narrow(-1, cdim + 3, 2);
+        if(absgrad)
+        {
+            v_means2d_abs = g.narrow(-1, cdim + 5, 2);
+        }
+        v_opacities = g.select(-1, nv - 1);
+    }
+    else
+    {
+        v_means2d   = at::zeros_like(means2d);
+        v_conics    = at::zeros_like(conics);
+        v_colors    = at::zeros_like(colors);
+        v_opacities = at::zeros_like(opacities);
+        if(absgrad)
+        {
+            v_means2d_abs = at::zeros_like(means2d);
+        }
     }
 
     launch_rasterize_to_pixels_3dgs_bwd_kernel(

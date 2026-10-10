@@ -206,13 +206,18 @@ __global__ void projection_geometry_adam_kernel(
     const uint32_t image_height,
     const int32_t *__restrict__ radii,     // [N, 2]
     const float *__restrict__ conics,      // [N, 3]
-    const float *__restrict__ v_means2d,   // [N, 2]
+    const float *__restrict__ v_means2d,   // [N, 2], rows sm apart
     const float *__restrict__ v_depths,    // [N] or nullptr (zero)
-    const float *__restrict__ v_conics,    // [N, 3]
+    const float *__restrict__ v_conics,    // [N, 3], rows sc apart
+    const int64_t sm,
+    const int64_t sc,
     const GeomAdamParam means,             // g2 = extra means gradient (optional), g unused
     const GeomAdamParam quats,
     const GeomAdamParam scales,            // log-scales; exp recomputed (projection input)
-    const GeomAdamParam opac               // g = opacity gradient (optional); sigmoid recomputed
+    const GeomAdamParam opac,              // g unused; sigmoid recomputed
+    const float *__restrict__ g_opac,      // [N] opacity gradient, rows so apart (nullptr: zero)
+    const int64_t so,
+    const bool g_opac_visible_only         // g_opac is zero for culled gaussians (not read there)
 )
 {
     const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -229,10 +234,12 @@ __global__ void projection_geometry_adam_kernel(
     vec3 v_mean(0.f);
     vec4 v_quat(0.f);
     vec3 v_scale(0.f);
-    if(radii[i * 2] > 0 && radii[i * 2 + 1] > 0)
+    const bool visible = radii[i * 2] > 0 && radii[i * 2 + 1] > 0;
+    if(visible)
     {
         const mat2 covar2d_inv   = mat2(conics[i * 3], conics[i * 3 + 1], conics[i * 3 + 1], conics[i * 3 + 2]);
-        const mat2 v_covar2d_inv = mat2(v_conics[i * 3], v_conics[i * 3 + 1] * .5f, v_conics[i * 3 + 1] * .5f, v_conics[i * 3 + 2]);
+        const float *vc          = v_conics + i * sc;
+        const mat2 v_covar2d_inv = mat2(vc[0], vc[1] * .5f, vc[1] * .5f, vc[2]);
         mat2 v_covar2d(0.f);
         inverse_vjp(covar2d_inv, v_covar2d_inv, v_covar2d);
 
@@ -253,7 +260,7 @@ __global__ void projection_geometry_adam_kernel(
         vec3 v_mean_c(0.f);
         persp_proj_vjp(
             mean_c, covar_c, K[0], K[4], K[2], K[5], image_width, image_height, v_covar2d,
-            vec2(v_means2d[i * 2], v_means2d[i * 2 + 1]), v_mean_c, v_covar_c
+            vec2(v_means2d[i * sm], v_means2d[i * sm + 1]), v_mean_c, v_covar_c
         );
         v_mean_c.z += v_depths != nullptr ? v_depths[i] : 0.f;
 
@@ -286,7 +293,19 @@ __global__ void projection_geometry_adam_kernel(
         const int64_t e = i * 3 + k;
         geom_adam_apply(scales, e, __fmul_rn(v_scale[k], scale[k]), ls[k]);
     }
-    geom_adam_elem(opac, i, ACT_SIGMOID);
+    // As geom_adam_elem(opac, i, ACT_SIGMOID) with g = g_opac (strided).
+    if(!opac.skip)
+    {
+        const float p0 = opac.p[i];
+        float grad     = 0.f;
+        if(g_opac != nullptr)
+        {
+            grad          = (visible || !g_opac_visible_only) ? g_opac[i * so] : 0.f;
+            const float y = act_sigmoid(p0);
+            grad          = __fmul_rn(__fmul_rn(grad, __fsub_rn(1.f, y)), y);
+        }
+        geom_adam_apply(opac, i, grad, p0);
+    }
 }
 
 // Gradient-free parts of the argument lists are as in geometry_adam; the
@@ -300,7 +319,7 @@ void projection_geometry_adam(
     at::ArrayRef<double> hp_opac,
     const at::Tensor &viewmats, const at::Tensor &Ks, int64_t image_width, int64_t image_height,
     const at::Tensor &radii, const at::Tensor &conics, const at::Tensor &v_means2d,
-    const at::optional<at::Tensor> &v_depths, const at::Tensor &v_conics
+    const at::optional<at::Tensor> &v_depths, const at::Tensor &v_conics, bool g_opac_visible_only
 )
 {
     DEVICE_GUARD(means);
@@ -308,13 +327,24 @@ void projection_geometry_adam(
     TORCH_CHECK(means.numel() == 3 * N && quats.numel() == 4 * N && scales.numel() == 3 * N && opac.numel() == N,
                 "projection_geometry_adam expects means [N,3], quats [N,4], scales [N,3], opacities [N]");
     TORCH_CHECK(viewmats.numel() == 16 && Ks.numel() == 9, "projection_geometry_adam supports one camera");
-    for(auto t: {viewmats, Ks, radii, conics, v_means2d, v_conics})
+    for(auto t: {viewmats, Ks, radii, conics})
     {
         CHECK_INPUT(t);
     }
+    // Gradients may be row-strided views (e.g. of the rasterizer's packed
+    // gradient buffer): [1, N, k] with unit inner stride.
+    auto row_stride = [N](const at::Tensor &t, int64_t k) -> int64_t
+    {
+        CHECK_DEVICE(t);
+        TORCH_CHECK(t.scalar_type() == at::kFloat && t.numel() == k * N && t.size(-1) == (k == 1 ? N : k),
+                    "projection_geometry_adam: bad gradient shape");
+        TORCH_CHECK(k == 1 || t.stride(-1) == 1, "projection_geometry_adam: gradient needs unit inner stride");
+        return k == 1 ? t.stride(-1) : t.stride(-2);
+    };
+    const int64_t sm = row_stride(v_means2d, 2), sc = row_stride(v_conics, 3);
+    const int64_t so = g_opac.has_value() ? row_stride(g_opac.value(), 1) : 1;
     TORCH_CHECK(viewmats.scalar_type() == at::kFloat && Ks.scalar_type() == at::kFloat, "float32 cameras expected");
-    TORCH_CHECK(radii.numel() == 2 * N && conics.numel() == 3 * N && v_means2d.numel() == 2 * N &&
-                    v_conics.numel() == 3 * N, "projection tensors must be [1, N, ...]");
+    TORCH_CHECK(radii.numel() == 2 * N && conics.numel() == 3 * N, "projection tensors must be [1, N, ...]");
     if(v_depths.has_value())
     {
         CHECK_INPUT(v_depths.value());
@@ -330,7 +360,8 @@ void projection_geometry_adam(
     auto pm = make_param(means, means_m, means_v, means, g2_means, none, hp_means[0], hp_means[1], hp_means[2], hp_means[3], hp_means[4]);
     auto pq = make_param(quats, quats_m, quats_v, quats, none, none, hp_quats[0], hp_quats[1], hp_quats[2], hp_quats[3], hp_quats[4]);
     auto ps = make_param(scales, scales_m, scales_v, scales, none, none, hp_scales[0], hp_scales[1], hp_scales[2], hp_scales[3], hp_scales[4]);
-    auto po = make_param(opac, opac_m, opac_v, g_opac, none, none, hp_opac[0], hp_opac[1], hp_opac[2], hp_opac[3], hp_opac[4]);
+    auto po = make_param(opac, opac_m, opac_v, none, none, none, hp_opac[0], hp_opac[1], hp_opac[2], hp_opac[3], hp_opac[4]);
+    po.skip       = !g_opac.has_value();
     ps.act_from_p = true;
     po.act_from_p = true;
     if(N == 0)
@@ -342,7 +373,8 @@ void projection_geometry_adam(
         N, viewmats.const_data_ptr<float>(), Ks.const_data_ptr<float>(), static_cast<uint32_t>(image_width),
         static_cast<uint32_t>(image_height), radii.const_data_ptr<int32_t>(), conics.const_data_ptr<float>(),
         v_means2d.const_data_ptr<float>(), v_depths.has_value() ? v_depths.value().const_data_ptr<float>() : nullptr,
-        v_conics.const_data_ptr<float>(), pm, pq, ps, po
+        v_conics.const_data_ptr<float>(), sm, sc, pm, pq, ps, po,
+        g_opac.has_value() ? g_opac.value().const_data_ptr<float>() : nullptr, so, g_opac_visible_only
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

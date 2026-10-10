@@ -392,6 +392,19 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     }
 }
 
+// Gradient outputs of the ppt backward as row-strided arrays: value index c of
+// gaussian g (c < CDIM colors, then conic xx/xy/yy, means2d x/y, [absgrad x/y],
+// opacity) is accumulated at ptr[c] + g * stride[c]. With separate contiguous
+// tensors stride is CDIM/3/2/2/1; when all outputs are views of one packed
+// [.., N, S] buffer (rasterize_to_pixels_3dgs_bwd does this) a gaussian's
+// gradients share one or two 32-byte sectors, so the warp's atomics touch about
+// half as many sectors.
+struct BwdGradOutputs
+{
+    float *ptr[16];
+    int64_t stride[16];
+};
+
 // Backward with PPT pixels per thread for 16x16 tiles (128 threads for PPT=2).
 // Each warp covers an 8x8 pixel patch (lane -> 8x4 sub-patch, pixel p adds
 // 4 * p rows). A thread first sums its pixels' contributions to a gaussian's
@@ -421,11 +434,7 @@ __global__ void __launch_bounds__(256 / PPT, 8) rasterize_to_pixels_3dgs_bwd_ppt
     const int32_t *__restrict__ last_ids,
     const float *__restrict__ v_render_colors,
     const float *__restrict__ v_render_alphas,
-    vec2 *__restrict__ v_means2d_abs,
-    vec2 *__restrict__ v_means2d,
-    vec3 *__restrict__ v_conics,
-    float *__restrict__ v_colors,
-    float *__restrict__ v_opacities
+    const BwdGradOutputs out
 )
 {
     static_assert(CDIM + 8 <= 16, "reduce-scatter path needs CDIM + 8 <= 16");
@@ -504,6 +513,8 @@ __global__ void __launch_bounds__(256 / PPT, 8) rasterize_to_pixels_3dgs_bwd_ppt
     constexpr int NV = CDIM + (ABS ? 8 : 6);
     // value index this lane pair holds after the reduce-scatter (-1: none)
     const int rs_c = reduce_scatter_index<NV>(lane);
+    float *const out_ptr     = rs_c >= 0 ? out.ptr[rs_c] : nullptr;
+    const int64_t out_stride = rs_c >= 0 ? out.stride[rs_c] : 0;
 
     float bg_dot[PPT];
 #    pragma unroll
@@ -635,20 +646,8 @@ __global__ void __launch_bounds__(256 / PPT, 8) rasterize_to_pixels_3dgs_bwd_ppt
             const float sum = warpReduceScatterN<NV>(vals, lane);
             if((lane & 1) == 0 && rs_c >= 0)
             {
-                const uint32_t c = static_cast<uint32_t>(rs_c);
-                const int32_t g  = id_batch[t];
-                float *ptr;
-                if(c < CDIM)
-                    ptr = v_colors + CDIM * g + c;
-                else if(c < CDIM + 3)
-                    ptr = (float *)(v_conics) + 3 * g + (c - CDIM);
-                else if(c < CDIM + 5)
-                    ptr = (float *)(v_means2d) + 2 * g + (c - CDIM - 3);
-                else if(ABS && c < CDIM + 7)
-                    ptr = (float *)(v_means2d_abs) + 2 * g + (c - CDIM - 5);
-                else
-                    ptr = v_opacities + g;
-                atomicAdd_system(ptr, sum);
+                const int32_t g = id_batch[t];
+                atomicAdd_system(out_ptr + static_cast<int64_t>(g) * out_stride, sum);
             }
         }
     }
@@ -720,6 +719,39 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
         {
             if(tile_size == 16)
             {
+                // Row-strided outputs: [..., N, k] (or [nnz, k]) with unit inner
+                // stride and rows evenly spaced across the leading dims; opacities
+                // are [..., N] (no component dim).
+                auto rows_of = [](const at::Tensor &t, int k, bool has_k_dim) -> std::pair<float *, int64_t>
+                {
+                    const int row_dim = has_k_dim ? t.dim() - 2 : t.dim() - 1;
+                    TORCH_CHECK(!has_k_dim || (t.size(-1) == k && t.stride(-1) == 1), "bwd output: bad inner layout");
+                    for(int d = row_dim - 1; d >= 0; --d)
+                    {
+                        TORCH_CHECK(t.stride(d) == t.size(d + 1) * t.stride(d + 1) || t.size(d) == 1,
+                                    "bwd output: rows must be evenly strided");
+                    }
+                    return {t.data_ptr<float>(), t.stride(row_dim)};
+                };
+                BwdGradOutputs out{};
+                {
+                    int c = 0;
+                    auto add = [&](const at::Tensor &t, int k, bool has_k_dim = true)
+                    {
+                        auto [p, st] = rows_of(t, k, has_k_dim);
+                        for(int j = 0; j < k; ++j, ++c)
+                        {
+                            out.ptr[c]    = p + j;
+                            out.stride[c] = st;
+                        }
+                    };
+                    add(v_colors, CDIM);
+                    add(v_conics, 3);
+                    add(v_means2d, 2);
+                    if(v_means2d_abs.has_value())
+                        add(v_means2d_abs.value(), 2);
+                    add(v_opacities, 1, false);
+                }
                 auto launch_ppt = [&]<bool ABS>()
                 {
                 rasterize_to_pixels_3dgs_bwd_ppt_kernel<CDIM, BWD_PPT, ABS>
@@ -742,12 +774,7 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
                         last_ids.const_data_ptr<int32_t>(),
                         v_render_colors.const_data_ptr<float>(),
                         v_render_alphas.const_data_ptr<float>(),
-                        v_means2d_abs.has_value() ? reinterpret_cast<vec2 *>(v_means2d_abs.value().data_ptr<float>())
-                                                  : nullptr,
-                        reinterpret_cast<vec2 *>(v_means2d.data_ptr<float>()),
-                        reinterpret_cast<vec3 *>(v_conics.data_ptr<float>()),
-                        v_colors.data_ptr<float>(),
-                        v_opacities.data_ptr<float>()
+                        out
                     );
                 };
                 if(v_means2d_abs.has_value())

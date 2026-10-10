@@ -88,13 +88,19 @@ class GeometryAdam:
         (pm, mm, vm, hm), (pq, mq, vq, hq), (ps, ms, vs, hs), (po, mo, vo, ho) = self._hps(
             (True, True, True, g_opac is not None)
         )
+        # The gradients may be row-strided views of the rasterizer's packed
+        # gradient buffer (read in place). An opacity gradient from that same
+        # buffer is zero for culled gaussians, so the kernel skips reading it there.
+        opac_from_raster = g_opac is not None and (
+            g_opac.untyped_storage().data_ptr() == v_means2d.untyped_storage().data_ptr()
+        )
         _make_lazy_cuda_func("projection_geometry_adam")(
             pm, mm, vm, None if extra is None else extra.contiguous(), hm,
             pq, mq, vq, hq,
             ps, ms, vs, hs,
-            po, mo, vo, None if g_opac is None else g_opac.contiguous(), ho,
-            viewmats, Ks, width, height, radii, conics, v_means2d.contiguous(),
-            None if v_depths is None else v_depths.contiguous(), v_conics.contiguous(),
+            po, mo, vo, g_opac, ho,
+            viewmats, Ks, width, height, radii, conics, v_means2d,
+            None if v_depths is None else v_depths.contiguous(), v_conics, opac_from_raster,
         )
 
     def step(self, g_means, g_quats, g_scales, scales_act, g_opac, opac_act):

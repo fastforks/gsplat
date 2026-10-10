@@ -611,7 +611,7 @@ class RegisterSphericalHarmonics:
             camera_ids,
             gaussian_ids,
             viewmats_rs,
-            v_colors,
+            v_colors.contiguous(),
             ctx.needs_input_grad[1],
             ctx.needs_input_grad[2],
             # PyTorch omits trailing schema-default arguments from
@@ -645,7 +645,7 @@ class RegisterSphericalHarmonicsL0:
     @classmethod
     def backward(cls, ctx, v_colors: Tensor):
         (sh0,) = ctx.saved_tensors
-        return (_make_lazy_cuda_func(f"{cls.base}_bwd")(sh0, v_colors),)
+        return (_make_lazy_cuda_func(f"{cls.base}_bwd")(sh0, v_colors.contiguous()),)
 
 
 class RegisterSphericalHarmonicsL1Plus(RegisterSphericalHarmonics):
@@ -1035,9 +1035,9 @@ class RegisterProjectionEWA3DGSFused:
             radii,
             conics,
             compensations,
-            v_means2d,
+            v_means2d.contiguous(),
             v_depths,
-            v_conics,
+            v_conics.contiguous(),
             v_compensations,
             ctx.needs_input_grad[
                 5
@@ -1163,9 +1163,9 @@ class RegisterProjectionEWA3DGSPacked:
             gaussian_ids,
             conics,
             compensations,
-            v_means2d,
+            v_means2d.contiguous(),
             v_depths,
-            v_conics,
+            v_conics.contiguous(),
             v_compensations,
             ctx.needs_input_grad[
                 5

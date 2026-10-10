@@ -268,7 +268,7 @@ class _LazySHColors(torch.autograd.Function):
         assert mgr.step == step - 1, "LazySHAdam: one backward per forward, in order"
         g0, sh0, s0, gN, shN, sN = mgr._args(step, means.device)
         v_means = _make_lazy_cuda_func("sh_colors_lazy_bwd_adam")(
-            ctx.degree, means.contiguous(), viewmats, v_colors.contiguous(),
+            ctx.degree, means.contiguous(), viewmats, v_colors,  # row-strided views OK
             sh0.data, s0["exp_avg"], s0["exp_avg_sq"], shN.data, sN["exp_avg"], sN["exp_avg_sq"],
             mgr.last, step, mgr.tabs, *g0["betas"], g0["eps"], *gN["betas"], gN["eps"],
             ctx.needs_input_grad[2],
