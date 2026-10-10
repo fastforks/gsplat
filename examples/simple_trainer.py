@@ -216,6 +216,11 @@ class Config:
     # With fused_projection_adam: update DefaultStrategy's grad2d / count stats
     # inside the fused projection backward (bitwise equal; one pass less).
     fused_strategy_stats: bool = False
+    # With fused_geometry_adam: keep the means/quats/scales/opacities Adam moments
+    # in bfloat16 with stochastic rounding (approximate).
+    geo_adam_bf16: bool = False
+    # PyTorch CUDA allocator with expandable segments (less reserved memory).
+    expandable_segments: bool = False
     # Turn on another SH degree every this steps
     sh_degree_interval: int = 1000
     # Initial opacity of GS
@@ -624,7 +629,11 @@ class Runner:
             if cfg.lazy_sh_adam
             else None
         )
-        self.geo_adam = GeometryAdam(self.optimizers) if cfg.fused_geometry_adam else None
+        self.geo_adam = (
+            GeometryAdam(self.optimizers, state_dtype=torch.bfloat16 if cfg.geo_adam_bf16 else torch.float32)
+            if cfg.fused_geometry_adam
+            else None
+        )
         if self.lazy_sh is not None and self.geo_adam is not None:
             self.lazy_sh.means_grad_sink = self.geo_adam
         self.splats = self.scene.splats
@@ -1842,6 +1851,12 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         cfg.disable_viewer = True
         if world_rank == 0:
             print("Viewer is disabled in distributed training.")
+
+    if cfg.expandable_segments:
+        # Before the first CUDA allocation. Densification grows every per-gaussian
+        # tensor each refine step; expandable segments avoid the fragmentation
+        # that otherwise inflates reserved memory.
+        torch.cuda.memory._set_allocator_settings("expandable_segments:True")
 
     runner = Runner(local_rank, world_rank, world_size, cfg)
 

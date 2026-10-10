@@ -23,7 +23,11 @@ from ..cuda._wrapper import _make_lazy_cuda_func
 class GeometryAdam:
     NAMES = ("means", "quats", "scales", "opacities")
 
-    def __init__(self, optimizers: Dict[str, torch.optim.Adam]):
+    def __init__(self, optimizers: Dict[str, torch.optim.Adam], state_dtype=torch.float32):
+        # state_dtype=torch.bfloat16: exp_avg / exp_avg_sq kept in bfloat16 with
+        # stochastic rounding (approximate; less memory traffic).
+        assert state_dtype in (torch.float32, torch.bfloat16)
+        self.state_dtype = state_dtype
         self.opts = [optimizers[n] for n in self.NAMES]
         # Extra means gradient handed over by another backward (e.g. LazySHAdam)
         # instead of going through autograd's accumulation; added in-kernel.
@@ -46,15 +50,19 @@ class GeometryAdam:
         state = opt.state[p]
         if len(state) == 0:
             state["step"] = torch.tensor(0.0, dtype=torch.float32)
-            state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-            state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+            state["exp_avg"] = torch.zeros_like(p, dtype=self.state_dtype, memory_format=torch.preserve_format)
+            state["exp_avg_sq"] = torch.zeros_like(p, dtype=self.state_dtype, memory_format=torch.preserve_format)
+        elif state["exp_avg"].dtype != self.state_dtype:
+            state["exp_avg"] = state["exp_avg"].to(self.state_dtype)
+            state["exp_avg_sq"] = state["exp_avg_sq"].to(self.state_dtype)
         return group, p, state
 
     def _hp(self, group, state):
         state["step"] += 1
         step = float(state["step"])
         beta1, beta2 = group["betas"]
-        return [beta1, beta2, group["eps"], group["lr"] / (1 - beta1**step), math.sqrt(1 - beta2**step)]
+        # 6th entry: the step, used as the stochastic-rounding key for bf16 moments
+        return [beta1, beta2, group["eps"], group["lr"] / (1 - beta1**step), math.sqrt(1 - beta2**step), step]
 
     def activate(self, means: Tensor, quats: Tensor, log_scales: Tensor, opacity_logits: Tensor):
         if not torch.is_grad_enabled():
