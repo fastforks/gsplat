@@ -159,7 +159,7 @@ def duplicate(
         return torch.nn.Parameter(torch.cat([p, p[sel]]), requires_grad=p.requires_grad)
 
     def optimizer_fn(key: str, v: Tensor) -> Tensor:
-        return torch.cat([v, torch.zeros((len(sel), *v.shape[1:]), device=device)])
+        return torch.cat([v, torch.zeros((len(sel), *v.shape[1:]), device=device, dtype=v.dtype)])
 
     # update the parameters and the state in the optimizers
     _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
@@ -219,7 +219,7 @@ def split(
         return p_new
 
     def optimizer_fn(key: str, v: Tensor) -> Tensor:
-        v_split = torch.zeros((2 * len(sel), *v.shape[1:]), device=device)
+        v_split = torch.zeros((2 * len(sel), *v.shape[1:]), device=device, dtype=v.dtype)
         return torch.cat([v[rest], v_split])
 
     # update the parameters and the state in the optimizers
@@ -387,14 +387,14 @@ def sample_add(
         return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
 
     def optimizer_fn(key: str, v: Tensor) -> Tensor:
-        v_new = torch.zeros((len(sampled_idxs), *v.shape[1:]), device=v.device)
+        v_new = torch.zeros((len(sampled_idxs), *v.shape[1:]), device=v.device, dtype=v.dtype)
         return torch.cat([v, v_new])
 
     # update the parameters and the state in the optimizers
     _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
     # update the extra running state
     for k, v in state.items():
-        v_new = torch.zeros((len(sampled_idxs), *v.shape[1:]), device=v.device)
+        v_new = torch.zeros((len(sampled_idxs), *v.shape[1:]), device=v.device, dtype=v.dtype)
         if isinstance(v, torch.Tensor):
             state[k] = torch.cat((v, v_new))
     if scene is not None:

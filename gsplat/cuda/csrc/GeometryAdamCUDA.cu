@@ -217,7 +217,11 @@ __global__ void projection_geometry_adam_kernel(
     const GeomAdamParam opac,              // g unused; sigmoid recomputed
     const float *__restrict__ g_opac,      // [N] opacity gradient, rows so apart (nullptr: zero)
     const int64_t so,
-    const bool g_opac_visible_only         // g_opac is zero for culled gaussians (not read there)
+    const bool g_opac_visible_only,        // g_opac is zero for culled gaussians (not read there)
+    float *__restrict__ stat_grad2d,       // [N] DefaultStrategy running stats (nullptr: not fused)
+    float *__restrict__ stat_count,        // [N]
+    const float stat_sx,
+    const float stat_sy
 )
 {
     const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -262,6 +266,15 @@ __global__ void projection_geometry_adam_kernel(
             mean_c, covar_c, K[0], K[4], K[2], K[5], image_width, image_height, v_covar2d,
             vec2(v_means2d[i * sm], v_means2d[i * sm + 1]), v_mean_c, v_covar_c
         );
+        if(stat_grad2d != nullptr)
+        {
+            // DefaultStrategy._update_state for one camera, as strategy_update_state_kernel
+            // (same correctly rounded operations); culled gaussians add zero there.
+            const float gx = __fmul_rn(v_means2d[i * sm], stat_sx), gy = __fmul_rn(v_means2d[i * sm + 1], stat_sy);
+            const float g  = __fadd_rn(0.f, __fsqrt_rn(__fadd_rn(__fmul_rn(gx, gx), __fmul_rn(gy, gy))));
+            stat_grad2d[i] = __fadd_rn(stat_grad2d[i], g);
+            stat_count[i]  = __fadd_rn(stat_count[i], __fadd_rn(0.f, 1.f));
+        }
         v_mean_c.z += v_depths != nullptr ? v_depths[i] : 0.f;
 
         mat3 v_covar(0.f);
@@ -319,7 +332,8 @@ void projection_geometry_adam(
     at::ArrayRef<double> hp_opac,
     const at::Tensor &viewmats, const at::Tensor &Ks, int64_t image_width, int64_t image_height,
     const at::Tensor &radii, const at::Tensor &conics, const at::Tensor &v_means2d,
-    const at::optional<at::Tensor> &v_depths, const at::Tensor &v_conics, bool g_opac_visible_only
+    const at::optional<at::Tensor> &v_depths, const at::Tensor &v_conics, bool g_opac_visible_only,
+    const at::optional<at::Tensor> &stat_grad2d, const at::optional<at::Tensor> &stat_count, double stat_sx, double stat_sy
 )
 {
     DEVICE_GUARD(means);
@@ -343,6 +357,15 @@ void projection_geometry_adam(
     };
     const int64_t sm = row_stride(v_means2d, 2), sc = row_stride(v_conics, 3);
     const int64_t so = g_opac.has_value() ? row_stride(g_opac.value(), 1) : 1;
+    TORCH_CHECK(stat_grad2d.has_value() == stat_count.has_value(), "strategy stats: give grad2d and count");
+    if(stat_grad2d.has_value())
+    {
+        CHECK_INPUT(stat_grad2d.value());
+        CHECK_INPUT(stat_count.value());
+        TORCH_CHECK(stat_grad2d.value().numel() == N && stat_count.value().numel() == N &&
+                        stat_grad2d.value().scalar_type() == at::kFloat && stat_count.value().scalar_type() == at::kFloat,
+                    "strategy stats must be float32 [N]");
+    }
     TORCH_CHECK(viewmats.scalar_type() == at::kFloat && Ks.scalar_type() == at::kFloat, "float32 cameras expected");
     TORCH_CHECK(radii.numel() == 2 * N && conics.numel() == 3 * N, "projection tensors must be [1, N, ...]");
     if(v_depths.has_value())
@@ -374,7 +397,10 @@ void projection_geometry_adam(
         static_cast<uint32_t>(image_height), radii.const_data_ptr<int32_t>(), conics.const_data_ptr<float>(),
         v_means2d.const_data_ptr<float>(), v_depths.has_value() ? v_depths.value().const_data_ptr<float>() : nullptr,
         v_conics.const_data_ptr<float>(), sm, sc, pm, pq, ps, po,
-        g_opac.has_value() ? g_opac.value().const_data_ptr<float>() : nullptr, so, g_opac_visible_only
+        g_opac.has_value() ? g_opac.value().const_data_ptr<float>() : nullptr, so, g_opac_visible_only,
+        stat_grad2d.has_value() ? stat_grad2d.value().data_ptr<float>() : nullptr,
+        stat_count.has_value() ? stat_count.value().data_ptr<float>() : nullptr, static_cast<float>(stat_sx),
+        static_cast<float>(stat_sy)
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

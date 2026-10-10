@@ -1295,6 +1295,13 @@ at::Tensor sh_colors_lazy_fwd(
     TORCH_CHECK(tabs.dim() == 2 && tabs.size(0) == 4 && step < tabs.size(1), "tabs must be [4, T] with T > step");
     const at::Tensor vm = viewmats.contiguous();
     TORCH_CHECK(mask.scalar_type() == at::kBool && mask.numel() == vm.numel() / 16 * shN.size(0), "mask must be [C, N]");
+    TORCH_CHECK(shN.scalar_type() == at::kFloat && sh0.scalar_type() == at::kFloat, "lazy SH requires fp32 coefficients");
+    TORCH_CHECK(shN_m.sizes() == shN.sizes() && shN_v.sizes() == shN.sizes() && sh0_m.sizes() == sh0.sizes() &&
+                    sh0_v.sizes() == sh0.sizes(), "lazy SH: Adam state shape");
+    TORCH_CHECK((shN_m.scalar_type() == at::kFloat || shN_m.scalar_type() == at::kBFloat16) &&
+                    shN_v.scalar_type() == shN_m.scalar_type() && sh0_m.scalar_type() == shN_m.scalar_type() &&
+                    sh0_v.scalar_type() == shN_m.scalar_type(),
+                "lazy SH: Adam moments must all be float32 or all bfloat16");
     auto colors = at::empty({vm.numel() / 16, shN.size(0), shN.size(2)}, means.options());
     launch_sh_colors_lazy_fwd_kernel(
         degrees_to_use, means, vm, mask, sh0, sh0_m, sh0_v, shN, shN_m, shN_v, last, static_cast<int>(step), tabs,
@@ -1342,6 +1349,10 @@ at::optional<at::Tensor> sh_colors_lazy_bwd_adam(
     TORCH_CHECK(sh0.dim() == 3 && sh0.size(0) == shN.size(0) && sh0.size(1) == 1 && sh0.size(2) == shN.size(2), "sh0 must be [N, 1, D]");
     TORCH_CHECK(sh0_m.sizes() == sh0.sizes() && sh0_v.sizes() == sh0.sizes(), "sh0 Adam state shape");
     TORCH_CHECK(shN_m.sizes() == shN.sizes() && shN_v.sizes() == shN.sizes(), "shN Adam state shape");
+    TORCH_CHECK((shN_m.scalar_type() == at::kFloat || shN_m.scalar_type() == at::kBFloat16) &&
+                    shN_v.scalar_type() == shN_m.scalar_type() && sh0_m.scalar_type() == shN_m.scalar_type() &&
+                    sh0_v.scalar_type() == shN_m.scalar_type(),
+                "lazy SH: Adam moments must all be float32 or all bfloat16");
     TORCH_CHECK(last.scalar_type() == at::kInt && last.numel() == shN.size(0), "last must be int32 [N]");
     TORCH_CHECK(means.dim() == 2 && means.size(0) == shN.size(0), "means must be [N, 3]");
     const at::Tensor grad_colors = row_strided_colors_grad(v_colors, viewmats, shN);
@@ -1378,6 +1389,9 @@ void sh_lazy_catchup(
     CHECK_INPUT(last);
     TORCH_CHECK(step_size_tab.is_contiguous() && bc2_sqrt_tab.is_contiguous(), "tables must be contiguous");
     TORCH_CHECK(last.numel() == p.size(0), "last must be [N]");
+    TORCH_CHECK(p.scalar_type() == at::kFloat && m.sizes() == p.sizes() && v.sizes() == p.sizes() &&
+                    (m.scalar_type() == at::kFloat || m.scalar_type() == at::kBFloat16) && v.scalar_type() == m.scalar_type(),
+                "sh_lazy_catchup: p float32, moments float32 or bfloat16");
     TORCH_CHECK(step < step_size_tab.numel() && step < bc2_sqrt_tab.numel(), "Adam step tables too short");
     launch_sh_lazy_catchup_kernel(
         p, m, v, last, static_cast<int>(step), step_size_tab, bc2_sqrt_tab, static_cast<float>(beta1),

@@ -1511,6 +1511,33 @@ void launch_spherical_harmonics_l1_plus_bwd_adam_kernel(
 // step_size, tabs[1][t] = sh0 bias_correction2_sqrt, tabs[2]/[3] for shN.
 // ---------------------------------------------------------------------------
 
+
+// Adam moments may be stored as float (default) or as bfloat16 bits (uint16_t,
+// opt-in): loads widen exactly; stores round stochastically with a
+// deterministic hash of (element, step, stream), so the rounding is unbiased
+// (bf16's 8-bit mantissa cannot represent beta2 = 0.999 decay steps with
+// round-to-nearest) and a replay produces the same bits.
+__device__ __forceinline__ float st_ld(const float *a, const int64_t i) { return a[i]; }
+__device__ __forceinline__ float st_ld(const uint16_t *a, const int64_t i)
+{
+    return __uint_as_float(static_cast<uint32_t>(a[i]) << 16);
+}
+__device__ __forceinline__ uint32_t sr_hash(uint32_t x)
+{
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+__device__ __forceinline__ void st_st(float *a, const int64_t i, const float x, const uint32_t, const uint32_t) { a[i] = x; }
+__device__ __forceinline__ void st_st(uint16_t *a, const int64_t i, const float x, const uint32_t step, const uint32_t salt)
+{
+    const uint32_t r = sr_hash(static_cast<uint32_t>(i) * 0x9e3779b1u ^ sr_hash(step * 2u + salt));
+    a[i]             = static_cast<uint16_t>((__float_as_uint(x) + (r & 0xffffu)) >> 16);
+}
+
 struct LazyAdamConsts
 {
     const float *step_size; // [T] indexed by step
@@ -1552,7 +1579,7 @@ lazy_adam_replay_mv(float &m, float &v, const LazyAdamConsts &c, const int from,
 // per row in the per-row phases). Rows' shN slabs are read with coalesced
 // sweeps, caught up, and staged in shared memory for the per-row math.
 
-template<int DEGREE>
+template<int DEGREE, typename S>
 __global__ void sh_colors_lazy_fwd_kernel(
     const uint32_t BC,
     const uint32_t N,
@@ -1563,11 +1590,11 @@ __global__ void sh_colors_lazy_fwd_kernel(
     const float *__restrict__ viewmats,
     const bool *__restrict__ mask, // [BC, N] rows needed this step (superset of visible)
     const float *__restrict__ sh0,
-    const float *__restrict__ sh0_m,
-    const float *__restrict__ sh0_v,
+    const S *__restrict__ sh0_m,
+    const S *__restrict__ sh0_v,
     const float *__restrict__ shN,
-    const float *__restrict__ shN_m,
-    const float *__restrict__ shN_v,
+    const S *__restrict__ shN_m,
+    const S *__restrict__ shN_v,
     const int32_t *__restrict__ last,
     const int step, // the step being taken; parameters are current as of step - 1
     const LazyAdamConsts c0,
@@ -1617,7 +1644,7 @@ __global__ void sh_colors_lazy_fwd_kernel(
             float p         = shN[i];
             if(row_from[lr] < to)
             {
-                float m = shN_m[i], v = shN_v[i];
+                float m = st_ld(shN_m, i), v = st_ld(shN_v, i);
                 lazy_adam_replay(p, m, v, cN, row_from[lr], to, zero);
             }
             p_slab[e] = p;
@@ -1635,7 +1662,7 @@ __global__ void sh_colors_lazy_fwd_kernel(
         s0 = sh0[row * D + c];
         if(row_from[local] < to)
         {
-            float m = sh0_m[row * D + c], v = sh0_v[row * D + c];
+            float m = st_ld(sh0_m, row * D + c), v = st_ld(sh0_v, row * D + c);
             lazy_adam_replay(s0, m, v, c0, row_from[local], to, zero);
         }
     }
@@ -1659,7 +1686,7 @@ __global__ void sh_colors_lazy_fwd_kernel(
     }
 }
 
-template<int DEGREE>
+template<int DEGREE, typename S>
 __global__ void sh_colors_lazy_bwd_adam_kernel(
     const uint32_t BC,
     const uint32_t N,
@@ -1671,11 +1698,11 @@ __global__ void sh_colors_lazy_bwd_adam_kernel(
     const float *__restrict__ v_colors, // [BC, N, D], rows vcs apart
     const int64_t vcs,
     float *__restrict__ sh0,
-    float *__restrict__ sh0_m,
-    float *__restrict__ sh0_v,
+    S *__restrict__ sh0_m,
+    S *__restrict__ sh0_v,
     float *__restrict__ shN,
-    float *__restrict__ shN_m,
-    float *__restrict__ shN_v,
+    S *__restrict__ shN_m,
+    S *__restrict__ shN_v,
     int32_t *__restrict__ last,
     const int step,
     const LazyAdamConsts c0,
@@ -1772,8 +1799,8 @@ __global__ void sh_colors_lazy_bwd_adam_kernel(
                 const int64_t gi = (row_begin + active_list[a]) * KD + (e - a * KD);
                 from_reg[u]      = row_from[a];
                 p_reg[u]         = shN[gi];
-                m_reg[u]         = shN_m[gi];
-                v_reg[u]         = shN_v[gi];
+                m_reg[u]         = st_ld(shN_m, gi);
+                v_reg[u]         = st_ld(shN_v, gi);
             }
         }
 #pragma unroll
@@ -1794,7 +1821,7 @@ __global__ void sh_colors_lazy_bwd_adam_kernel(
             float p          = shN[gi];
             if(from < to)
             {
-                float m = shN_m[gi], v = shN_v[gi];
+                float m = st_ld(shN_m, gi), v = st_ld(shN_v, gi);
                 lazy_adam_replay(p, m, v, cN, from, to, zero);
             }
             p_slab[e] = p;
@@ -1816,7 +1843,7 @@ __global__ void sh_colors_lazy_bwd_adam_kernel(
         {
             acc[k] = 0.f;
         }
-        float s0 = sh0[row * D + c], s0_m = sh0_m[row * D + c], s0_v = sh0_v[row * D + c];
+        float s0 = sh0[row * D + c], s0_m = st_ld(sh0_m, row * D + c), s0_v = st_ld(sh0_v, row * D + c);
         lazy_adam_replay(s0, s0_m, s0_v, c0, from, to, zero);
         const float *ce = p_slab + a * KD;
         float v_sh0     = 0.f;
@@ -1872,8 +1899,8 @@ __global__ void sh_colors_lazy_bwd_adam_kernel(
         }
         lazy_adam_update(v_sh0, s0, s0_m, s0_v, c0, step);
         sh0[row * D + c]   = s0;
-        sh0_m[row * D + c] = s0_m;
-        sh0_v[row * D + c] = s0_v;
+        st_st(sh0_m, row * D + c, s0_m, step, 0u);
+        st_st(sh0_v, row * D + c, s0_v, step, 1u);
     }
     __syncthreads();
 
@@ -1890,21 +1917,21 @@ __global__ void sh_colors_lazy_bwd_adam_kernel(
             const int64_t gi = (row_begin + active_list[a]) * KD + (e - a * KD);
             float p = p_slab[e], m = m_reg[u], v = v_reg[u];
             lazy_adam_update(grad_slab[e], p, m, v, cN, step);
-            shN[gi]   = p;
-            shN_m[gi] = m;
-            shN_v[gi] = v;
+            shN[gi] = p;
+            st_st(shN_m, gi, m, step, 2u);
+            st_st(shN_v, gi, v, step, 3u);
         }
     }
     for(uint32_t e = tid + LAZY_REG_U * blockDim.x; e < total; e += blockDim.x)
     {
         const uint32_t a = e / KD;
         const int64_t gi = (row_begin + active_list[a]) * KD + (e - a * KD);
-        float p = p_slab[e], m = shN_m[gi], v = shN_v[gi];
+        float p = p_slab[e], m = st_ld(shN_m, gi), v = st_ld(shN_v, gi);
         lazy_adam_replay_mv(m, v, cN, row_from[a], to, zero);
         lazy_adam_update(grad_slab[e], p, m, v, cN, step);
-        shN[gi]   = p;
-        shN_m[gi] = m;
-        shN_v[gi] = v;
+        shN[gi] = p;
+        st_st(shN_m, gi, m, step, 2u);
+        st_st(shN_v, gi, v, step, 3u);
     }
     if(tid < static_cast<uint32_t>(n_active))
     {
@@ -1913,12 +1940,14 @@ __global__ void sh_colors_lazy_bwd_adam_kernel(
 }
 
 // Replay all deferred steps up to and including `step` for every row.
+template<typename S>
 __global__ void sh_lazy_catchup_kernel(
     const int64_t n_elems, // N * KD
     const uint32_t KD,
     float *__restrict__ p,
-    float *__restrict__ m,
-    float *__restrict__ v,
+    S *__restrict__ m,
+    S *__restrict__ v,
+    const uint32_t salt,
     const int32_t *__restrict__ last,
     const int step,
     const LazyAdamConsts consts,
@@ -1935,11 +1964,11 @@ __global__ void sh_lazy_catchup_kernel(
     {
         return;
     }
-    float pp = p[i], mm = m[i], vv = v[i];
+    float pp = p[i], mm = st_ld(m, i), vv = st_ld(v, i);
     lazy_adam_replay(pp, mm, vv, consts, from, step, zero);
     p[i] = pp;
-    m[i] = mm;
-    v[i] = vv;
+    st_st(m, i, mm, step, salt);
+    st_st(v, i, vv, step, salt + 1u);
 }
 
 void launch_sh_colors_lazy_fwd_kernel(
@@ -1987,7 +2016,9 @@ void launch_sh_colors_lazy_fwd_kernel(
         dispatch::IntParam<0, 1, 2, 3>{static_cast<int>(degrees_to_use)},
         [&]<typename DegConst>()
         {
-            auto kernel = sh_colors_lazy_fwd_kernel<DegConst::value>;
+            auto run = [&]<typename S>()
+            {
+            auto kernel = sh_colors_lazy_fwd_kernel<DegConst::value, S>;
             if(shmem > 48 * 1024)
             {
                 C10_CUDA_CHECK(
@@ -2004,11 +2035,11 @@ void launch_sh_colors_lazy_fwd_kernel(
                 viewmats.const_data_ptr<float>(),
                 mask.const_data_ptr<bool>(),
                 sh0.const_data_ptr<float>(),
-                sh0_m.const_data_ptr<float>(),
-                sh0_v.const_data_ptr<float>(),
+                static_cast<const S *>(sh0_m.const_data_ptr()),
+                static_cast<const S *>(sh0_v.const_data_ptr()),
                 shN.const_data_ptr<float>(),
-                shN_m.const_data_ptr<float>(),
-                shN_v.const_data_ptr<float>(),
+                static_cast<const S *>(shN_m.const_data_ptr()),
+                static_cast<const S *>(shN_v.const_data_ptr()),
                 last.const_data_ptr<int32_t>(),
                 step,
                 c0,
@@ -2017,6 +2048,11 @@ void launch_sh_colors_lazy_fwd_kernel(
                 colors.data_ptr<float>()
             );
             C10_CUDA_KERNEL_LAUNCH_CHECK();
+            };
+            if(shN_m.scalar_type() == at::kBFloat16)
+                run.template operator()<uint16_t>();
+            else
+                run.template operator()<float>();
         }
     );
     TORCH_CHECK(dispatched, "Unsupported SH degree: ", degrees_to_use);
@@ -2069,7 +2105,9 @@ void launch_sh_colors_lazy_bwd_adam_kernel(
         dispatch::IntParam<0, 1, 2, 3>{static_cast<int>(degrees_to_use)},
         [&]<typename DegConst>()
         {
-            auto kernel = sh_colors_lazy_bwd_adam_kernel<DegConst::value>;
+            auto run = [&]<typename S>()
+            {
+            auto kernel = sh_colors_lazy_bwd_adam_kernel<DegConst::value, S>;
             if(shmem > 48 * 1024)
             {
                 C10_CUDA_CHECK(
@@ -2087,11 +2125,11 @@ void launch_sh_colors_lazy_bwd_adam_kernel(
                 v_colors.const_data_ptr<float>(),
                 v_colors.stride(-2),
                 sh0.data_ptr<float>(),
-                sh0_m.data_ptr<float>(),
-                sh0_v.data_ptr<float>(),
+                static_cast<S *>(sh0_m.data_ptr()),
+                static_cast<S *>(sh0_v.data_ptr()),
                 shN.data_ptr<float>(),
-                shN_m.data_ptr<float>(),
-                shN_v.data_ptr<float>(),
+                static_cast<S *>(shN_m.data_ptr()),
+                static_cast<S *>(shN_v.data_ptr()),
                 last.data_ptr<int32_t>(),
                 step,
                 c0,
@@ -2100,6 +2138,11 @@ void launch_sh_colors_lazy_bwd_adam_kernel(
                 v_means.has_value() ? v_means.value().data_ptr<float>() : nullptr
             );
             C10_CUDA_KERNEL_LAUNCH_CHECK();
+            };
+            if(shN_m.scalar_type() == at::kBFloat16)
+                run.template operator()<uint16_t>();
+            else
+                run.template operator()<float>();
         }
     );
     TORCH_CHECK(dispatched, "Unsupported SH degree: ", degrees_to_use);
@@ -2127,17 +2170,26 @@ void launch_sh_lazy_catchup_kernel(
     const LazyAdamConsts consts   = {step_size_tab.const_data_ptr<float>(), bc2_sqrt_tab.const_data_ptr<float>(), beta1, beta2, eps};
     constexpr unsigned int threads = 256;
     const unsigned int blocks      = static_cast<unsigned int>(::cuda::ceil_div<int64_t>(n, threads));
-    sh_lazy_catchup_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+    auto run = [&]<typename S>()
+    {
+    // salt: distinct rounding streams for sh0 (D <= 4 columns) and shN moments
+    sh_lazy_catchup_kernel<S><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         n,
         KD,
         p.data_ptr<float>(),
-        m.data_ptr<float>(),
-        v.data_ptr<float>(),
+        static_cast<S *>(m.data_ptr()),
+        static_cast<S *>(v.data_ptr()),
+        KD <= 4 ? 4u : 6u,
         last.const_data_ptr<int32_t>(),
         step,
         consts,
         0.f
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+    };
+    if(m.scalar_type() == at::kBFloat16)
+        run.template operator()<uint16_t>();
+    else
+        run.template operator()<float>();
 }
 } // namespace gsplat

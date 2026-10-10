@@ -1036,7 +1036,8 @@ TORCH_LIBRARY(gsplat, m)
         "Tensor(g!) scales, Tensor(h!) scales_m, Tensor(i!) scales_v, float[] hp_scales, "
         "Tensor(j!) opac, Tensor(k!) opac_m, Tensor(l!) opac_v, Tensor? g_opac, float[] hp_opac, "
         "Tensor viewmats, Tensor Ks, int image_width, int image_height, Tensor radii, Tensor conics, "
-        "Tensor v_means2d, Tensor? v_depths, Tensor v_conics, bool g_opac_visible_only=False) -> ()"
+        "Tensor v_means2d, Tensor? v_depths, Tensor v_conics, bool g_opac_visible_only=False, "
+        "Tensor(m!)? stat_grad2d=None, Tensor(n!)? stat_count=None, float stat_sx=1.0, float stat_sy=1.0) -> ()"
     );
     m.def(
         "projection_act_fwd(Tensor means, Tensor quats, Tensor log_scales, Tensor logits, Tensor viewmats, "

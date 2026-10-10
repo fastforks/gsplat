@@ -172,6 +172,8 @@ class DefaultStrategy(Strategy):
         assert (
             self.key_for_gradient in info
         ), "The 2D means of the Gaussians is required but missing."
+        if info.get("_stats_fused", False):
+            return  # the renderer's fused backward updates grad2d / count itself
         if self.grad_hook and not self.absgrad:
             # The hook must not reference info (info -> tensor -> hook -> info
             # would keep every step's graph alive until garbage collection).
@@ -245,6 +247,8 @@ class DefaultStrategy(Strategy):
         info: Dict[str, Any],
         packed: bool = False,
     ):
+        if info.get("_stats_fused", False):
+            return  # already updated inside the backward (see GeometryAdam.strategy_stats)
         for key in [
             "width",
             "height",

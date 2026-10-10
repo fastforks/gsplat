@@ -149,7 +149,11 @@ class LazySHAdam:
 
     _CHUNK = 1024
 
-    def __init__(self, opt_sh0: torch.optim.Adam, opt_shN: torch.optim.Adam):
+    def __init__(self, opt_sh0: torch.optim.Adam, opt_shN: torch.optim.Adam, state_dtype=torch.float32):
+        # state_dtype=torch.bfloat16 stores exp_avg / exp_avg_sq in bfloat16 with
+        # stochastic rounding (approximate, not bitwise equal to torch Adam).
+        assert state_dtype in (torch.float32, torch.bfloat16)
+        self.state_dtype = state_dtype
         self.opts = (opt_sh0, opt_shN)
         self.step = 0  # optimizer steps applied (eagerly or deferred)
         self.last: Tensor = None  # [N] int32, last step applied per row
@@ -169,8 +173,11 @@ class LazySHAdam:
         state = opt.state[p]
         if len(state) == 0:
             state["step"] = torch.tensor(float(self.step), dtype=torch.float32)
-            state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-            state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+            state["exp_avg"] = torch.zeros_like(p, dtype=self.state_dtype, memory_format=torch.preserve_format)
+            state["exp_avg_sq"] = torch.zeros_like(p, dtype=self.state_dtype, memory_format=torch.preserve_format)
+        elif state["exp_avg"].dtype != self.state_dtype:
+            state["exp_avg"] = state["exp_avg"].to(self.state_dtype)
+            state["exp_avg_sq"] = state["exp_avg_sq"].to(self.state_dtype)
         return group, p, state
 
     def _hparams(self):

@@ -28,6 +28,9 @@ class GeometryAdam:
         # Extra means gradient handed over by another backward (e.g. LazySHAdam)
         # instead of going through autograd's accumulation; added in-kernel.
         self.extra_means_grad = None
+        # Optional (grad2d, count, sx, sy): DefaultStrategy running stats updated
+        # inside the next projection backward (set per step, consumed once).
+        self.strategy_stats = None
 
     def add_means_grad(self, g: Tensor):
         if self.extra_means_grad is None:
@@ -101,7 +104,9 @@ class GeometryAdam:
             po, mo, vo, g_opac, ho,
             viewmats, Ks, width, height, radii, conics, v_means2d,
             None if v_depths is None else v_depths.contiguous(), v_conics, opac_from_raster,
+            *(self.strategy_stats or (None, None, 1.0, 1.0)),
         )
+        self.strategy_stats = None
 
     def step(self, g_means, g_quats, g_scales, scales_act, g_opac, opac_act):
         args = []
