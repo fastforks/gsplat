@@ -117,6 +117,9 @@ class DefaultStrategy(Strategy):
     # Capture the 2D-means gradient with a hook instead of retain_grad(): the
     # same tensor without the copy retain_grad makes; info[key].grad stays None.
     grad_hook: bool = False
+    # Release cached GPU memory after every refinement (upstream behavior). The
+    # next steps then re-allocate the grown tensors from the driver.
+    empty_cache_after_refine: bool = True
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy.
@@ -230,7 +233,8 @@ class DefaultStrategy(Strategy):
             state["count"].zero_()
             if self.refine_scale2d_stop_iter > 0:
                 state["radii"].zero_()
-            torch.cuda.empty_cache()
+            if self.empty_cache_after_refine:
+                torch.cuda.empty_cache()
 
         if step % self.reset_every == 0 and step > 0:
             reset_opa(
