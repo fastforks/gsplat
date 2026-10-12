@@ -49,8 +49,33 @@ from gsplat.losses import (
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
-from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
-from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+import threading
+
+# torchmetrics (with torchvision / dynamo / scipy behind it) takes ~1.7 s to
+# import and is only needed for evaluation: import it in a background thread
+# (started in main(), overlapping data loading and CUDA setup) and build the
+# metric modules on first use.
+_METRICS = {}
+
+
+def _import_metrics():
+    from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+    from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+
+    _METRICS.update(psnr=PeakSignalNoiseRatio, ssim=StructuralSimilarityIndexMeasure,
+                    lpips=LearnedPerceptualImagePatchSimilarity)
+
+
+_metrics_import = threading.Thread(target=_import_metrics, daemon=True)
+
+
+def _metric_classes():
+    if not _METRICS:
+        if _metrics_import.is_alive() or _metrics_import.ident is not None:
+            _metrics_import.join()
+        if not _METRICS:
+            _import_metrics()
+    return _METRICS
 from typing_extensions import Literal, assert_never
 from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
 
@@ -739,21 +764,13 @@ class Runner:
                 self.post_processing_module.create_optimizers()
             )
 
-        # Losses & Metrics.
-        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
-        self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
-
-        if cfg.lpips_net == "alex":
-            self.lpips = LearnedPerceptualImagePatchSimilarity(
-                net_type="alex", normalize=True
-            ).to(self.device)
-        elif cfg.lpips_net == "vgg":
-            # The 3DGS official repo uses lpips vgg, which is equivalent with the following:
-            self.lpips = LearnedPerceptualImagePatchSimilarity(
-                net_type="vgg", normalize=False
-            ).to(self.device)
-        else:
+        # Losses & Metrics. Built here (joining the background import) rather
+        # than on first use: their construction draws from the CPU RNG, which
+        # also drives the training image order.
+        if cfg.lpips_net not in ("alex", "vgg"):
             raise ValueError(f"Unknown LPIPS network: {cfg.lpips_net}")
+        self._metric_modules = None
+        self._metrics()
 
         # Viewer
         if not self.cfg.disable_viewer:
@@ -853,6 +870,31 @@ class Runner:
             "_stats_fused": stats_fused,
         }
         return render_colors, render_alphas, info
+
+    def _metrics(self):
+        if self._metric_modules is None:
+            M = _metric_classes()
+            ssim = M["ssim"](data_range=1.0).to(self.device)
+            psnr = M["psnr"](data_range=1.0).to(self.device)
+            if self.cfg.lpips_net == "alex":
+                lpips = M["lpips"](net_type="alex", normalize=True)
+            else:
+                # The 3DGS official repo uses lpips vgg, which is equivalent with the following:
+                lpips = M["lpips"](net_type="vgg", normalize=False)
+            self._metric_modules = (ssim, psnr, lpips.to(self.device))
+        return self._metric_modules
+
+    @property
+    def ssim(self):
+        return self._metrics()[0]
+
+    @property
+    def psnr(self):
+        return self._metrics()[1]
+
+    @property
+    def lpips(self):
+        return self._metrics()[2]
 
     def rasterize_splats(
         self,
@@ -1851,6 +1893,9 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         cfg.disable_viewer = True
         if world_rank == 0:
             print("Viewer is disabled in distributed training.")
+
+    if not _metrics_import.is_alive() and _metrics_import.ident is None:
+        _metrics_import.start()
 
     if cfg.expandable_segments:
         # Before the first CUDA allocation. Densification grows every per-gaussian
