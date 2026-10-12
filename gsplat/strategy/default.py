@@ -120,6 +120,9 @@ class DefaultStrategy(Strategy):
     # Capture the 2D-means gradient with a hook instead of retain_grad(): the
     # same tensor without the copy retain_grad makes; info[key].grad stays None.
     grad_hook: bool = False
+    # Release cached GPU memory after every refinement (upstream behavior). The
+    # next steps then re-allocate the grown tensors from the driver.
+    empty_cache_after_refine: bool = True
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy.
@@ -175,6 +178,8 @@ class DefaultStrategy(Strategy):
         assert (
             self.key_for_gradient in info
         ), "The 2D means of the Gaussians is required but missing."
+        if info.get("_stats_fused", False):
+            return  # the renderer's fused backward updates grad2d / count itself
         if self.grad_hook and not self.absgrad:
             # The hook must not reference info (info -> tensor -> hook -> info
             # would keep every step's graph alive until garbage collection).
@@ -231,7 +236,8 @@ class DefaultStrategy(Strategy):
             state["count"].zero_()
             if self.refine_scale2d_stop_iter > 0:
                 state["radii"].zero_()
-            torch.cuda.empty_cache()
+            if self.empty_cache_after_refine:
+                torch.cuda.empty_cache()
 
         if step % self.reset_every == 0 and step > 0:
             reset_opa(
@@ -248,6 +254,8 @@ class DefaultStrategy(Strategy):
         info: Dict[str, Any],
         packed: bool = False,
     ):
+        if info.get("_stats_fused", False):
+            return  # already updated inside the backward (see GeometryAdam.strategy_stats)
         for key in [
             "width",
             "height",
@@ -289,7 +297,7 @@ class DefaultStrategy(Strategy):
         ):
             # One fused pass; same values as the dense tensor-op path below.
             _make_lazy_cuda_func("strategy_update_state")(
-                grads.contiguous(),
+                grads if grads.stride(-1) == 1 else grads.contiguous(),  # row-strided view OK
                 info["radii"].contiguous(),
                 sx,
                 sy,

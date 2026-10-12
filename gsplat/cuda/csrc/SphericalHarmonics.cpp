@@ -1091,6 +1091,21 @@ SphericalHarmonicsBwdResult spherical_harmonics_l1_plus_bwd_privateuseone(
     };
 }
 
+// v_colors may be a row-strided view (the rasterizer's packed gradients):
+// [C, N, D] with unit inner stride and evenly strided rows; anything else is
+// made contiguous.
+static at::Tensor row_strided_colors_grad(const at::Tensor &v_colors, const at::Tensor &viewmats, const at::Tensor &shN)
+{
+    at::Tensor grad_colors = v_colors;
+    if(!(v_colors.dim() == 3 && v_colors.stride(-1) == 1 && v_colors.stride(0) == v_colors.size(1) * v_colors.stride(1)))
+    {
+        grad_colors = v_colors.contiguous();
+    }
+    CHECK_DEVICE(grad_colors);
+    TORCH_CHECK(grad_colors.numel() == viewmats.numel() / 16 * shN.size(0) * shN.size(2), "v_colors must be [C, N, D]");
+    return grad_colors;
+}
+
 // Backward of spherical_harmonics_l1_plus fused with an in-place Adam step on
 // shN (see launch_spherical_harmonics_l1_plus_bwd_adam_kernel). Returns v_means.
 at::optional<at::Tensor> spherical_harmonics_l1_plus_bwd_adam(
@@ -1119,8 +1134,7 @@ at::optional<at::Tensor> spherical_harmonics_l1_plus_bwd_adam(
     TORCH_CHECK(shN.scalar_type() == at::kFloat, "fused SH Adam requires fp32 shN");
     TORCH_CHECK(shN.dim() == 3 && shN.size(0) == means.size(0), "shN must be [N, K, D]");
     TORCH_CHECK(exp_avg.sizes() == shN.sizes() && exp_avg_sq.sizes() == shN.sizes(), "Adam state shape mismatch");
-    at::Tensor grad_colors = v_colors.contiguous();
-    TORCH_CHECK(grad_colors.numel() == viewmats.numel() / 16 * shN.size(0) * shN.size(2), "v_colors must be [C, N, D]");
+    const at::Tensor grad_colors = row_strided_colors_grad(v_colors, viewmats, shN).contiguous();
     at::Tensor v_means;
     if(compute_v_means)
     {
@@ -1208,8 +1222,7 @@ at::optional<at::Tensor> sh_colors_fused_bwd_adam(
     CHECK_INPUT(sh0_exp_avg_sq);
     TORCH_CHECK(shN_exp_avg.sizes() == shN.sizes() && shN_exp_avg_sq.sizes() == shN.sizes(), "shN Adam state shape");
     TORCH_CHECK(sh0_exp_avg.sizes() == sh0.sizes() && sh0_exp_avg_sq.sizes() == sh0.sizes(), "sh0 Adam state shape");
-    at::Tensor grad_colors = v_colors.contiguous();
-    TORCH_CHECK(grad_colors.numel() == viewmats.numel() / 16 * shN.size(0) * shN.size(2), "v_colors must be [C, N, D]");
+    const at::Tensor grad_colors = row_strided_colors_grad(v_colors, viewmats, shN).contiguous();
     at::Tensor v_means;
     if(compute_v_means)
     {
@@ -1285,9 +1298,10 @@ at::Tensor sh_colors_lazy_fwd(
     TORCH_CHECK(shN.scalar_type() == at::kFloat && sh0.scalar_type() == at::kFloat, "lazy SH requires fp32 coefficients");
     TORCH_CHECK(shN_m.sizes() == shN.sizes() && shN_v.sizes() == shN.sizes() && sh0_m.sizes() == sh0.sizes() &&
                     sh0_v.sizes() == sh0.sizes(), "lazy SH: Adam state shape");
-    TORCH_CHECK(shN_m.scalar_type() == at::kFloat && shN_v.scalar_type() == at::kFloat &&
-                    sh0_m.scalar_type() == at::kFloat && sh0_v.scalar_type() == at::kFloat,
-                "lazy SH: Adam moments must be float32");
+    TORCH_CHECK((shN_m.scalar_type() == at::kFloat || shN_m.scalar_type() == at::kBFloat16) &&
+                    shN_v.scalar_type() == shN_m.scalar_type() && sh0_m.scalar_type() == shN_m.scalar_type() &&
+                    sh0_v.scalar_type() == shN_m.scalar_type(),
+                "lazy SH: Adam moments must all be float32 or all bfloat16");
     auto colors = at::empty({vm.numel() / 16, shN.size(0), shN.size(2)}, means.options());
     launch_sh_colors_lazy_fwd_kernel(
         degrees_to_use, means, vm, mask, sh0, sh0_m, sh0_v, shN, shN_m, shN_v, last, static_cast<int>(step), tabs,
@@ -1335,10 +1349,13 @@ at::optional<at::Tensor> sh_colors_lazy_bwd_adam(
     TORCH_CHECK(sh0.dim() == 3 && sh0.size(0) == shN.size(0) && sh0.size(1) == 1 && sh0.size(2) == shN.size(2), "sh0 must be [N, 1, D]");
     TORCH_CHECK(sh0_m.sizes() == sh0.sizes() && sh0_v.sizes() == sh0.sizes(), "sh0 Adam state shape");
     TORCH_CHECK(shN_m.sizes() == shN.sizes() && shN_v.sizes() == shN.sizes(), "shN Adam state shape");
+    TORCH_CHECK((shN_m.scalar_type() == at::kFloat || shN_m.scalar_type() == at::kBFloat16) &&
+                    shN_v.scalar_type() == shN_m.scalar_type() && sh0_m.scalar_type() == shN_m.scalar_type() &&
+                    sh0_v.scalar_type() == shN_m.scalar_type(),
+                "lazy SH: Adam moments must all be float32 or all bfloat16");
     TORCH_CHECK(last.scalar_type() == at::kInt && last.numel() == shN.size(0), "last must be int32 [N]");
     TORCH_CHECK(means.dim() == 2 && means.size(0) == shN.size(0), "means must be [N, 3]");
-    at::Tensor grad_colors = v_colors.contiguous();
-    TORCH_CHECK(grad_colors.numel() == viewmats.numel() / 16 * shN.size(0) * shN.size(2), "v_colors must be [C, N, D]");
+    const at::Tensor grad_colors = row_strided_colors_grad(v_colors, viewmats, shN);
     at::Tensor v_means;
     if(compute_v_means)
     {
@@ -1373,8 +1390,8 @@ void sh_lazy_catchup(
     TORCH_CHECK(step_size_tab.is_contiguous() && bc2_sqrt_tab.is_contiguous(), "tables must be contiguous");
     TORCH_CHECK(last.numel() == p.size(0), "last must be [N]");
     TORCH_CHECK(p.scalar_type() == at::kFloat && m.sizes() == p.sizes() && v.sizes() == p.sizes() &&
-                    m.scalar_type() == at::kFloat && v.scalar_type() == at::kFloat,
-                "sh_lazy_catchup: p and moments must be float32 of the same shape");
+                    (m.scalar_type() == at::kFloat || m.scalar_type() == at::kBFloat16) && v.scalar_type() == m.scalar_type(),
+                "sh_lazy_catchup: p float32, moments float32 or bfloat16");
     TORCH_CHECK(step < step_size_tab.numel() && step < bc2_sqrt_tab.numel(), "Adam step tables too short");
     launch_sh_lazy_catchup_kernel(
         p, m, v, last, static_cast<int>(step), step_size_tab, bc2_sqrt_tab, static_cast<float>(beta1),

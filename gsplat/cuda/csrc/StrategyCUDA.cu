@@ -24,7 +24,8 @@ namespace gsplat
 __global__ void strategy_update_state_kernel(
     const uint32_t C,
     const uint32_t N,
-    const float *__restrict__ grads,  // [C, N, 2]
+    const float *__restrict__ grads,  // [C, N, 2], rows gs apart
+    const int64_t gs,
     const int32_t *__restrict__ radii, // [C, N, 2]
     const float sx,
     const float sy,
@@ -46,7 +47,7 @@ __global__ void strategy_update_state_kernel(
         {
             continue;
         }
-        const float2 g = reinterpret_cast<const float2 *>(grads)[i];
+        const float2 g = gs == 2 ? reinterpret_cast<const float2 *>(grads)[i] : make_float2(grads[i * gs], grads[i * gs + 1]);
         const float gx = __fmul_rn(g.x, sx), gy = __fmul_rn(g.y, sy);
         g_sum          = __fadd_rn(g_sum, __fsqrt_rn(__fadd_rn(__fmul_rn(gx, gx), __fmul_rn(gy, gy))));
         c_sum          = __fadd_rn(c_sum, 1.f);
@@ -65,7 +66,10 @@ void strategy_update_state(
 )
 {
     DEVICE_GUARD(grads);
-    CHECK_INPUT(grads);
+    // grads may be a row-strided view (the rasterizer's packed gradient buffer).
+    CHECK_DEVICE(grads);
+    TORCH_CHECK(grads.dim() == 3 && grads.stride(-1) == 1 && grads.stride(0) == grads.size(1) * grads.stride(1),
+                "grads must be [C, N, 2] with evenly strided rows");
     CHECK_INPUT(radii);
     CHECK_INPUT(grad2d);
     CHECK_INPUT(count);
@@ -83,6 +87,7 @@ void strategy_update_state(
         C,
         N,
         grads.const_data_ptr<float>(),
+        grads.stride(1),
         radii.const_data_ptr<int32_t>(),
         static_cast<float>(sx),
         static_cast<float>(sy),
