@@ -160,6 +160,62 @@ inline __device__ void warpSum(float *val, WarpT &warp)
     }
 }
 
+// Reduce-scatter of NV <= 16 per-lane values over a full warp. At each level
+// (lane bit 16, 8, 4, 2) the value list is halved (ceil/floor) and every lane
+// sends the half it does not keep, so e.g. NV = 9 values take 12 shuffles
+// instead of 45 for nine separate warp reductions. Afterwards lanes 2c and
+// 2c + 1 both hold the warp-wide total of value reduce_scatter_index<NV>(lane)
+// (-1: no value for this lane pair), so up to 16 atomics can be issued in
+// parallel. Must be called by all 32 lanes; v is used as scratch.
+template<int N, uint32_t MASK>
+inline __device__ void reduceScatterLevel(float (&v)[16], const uint32_t lane)
+{
+    if constexpr(MASK >= 2)
+    {
+        constexpr int lo = (N + 1) / 2;
+        const bool upper = lane & MASK;
+#    pragma unroll
+        for(int i = 0; i < lo; ++i)
+        {
+            const float hi   = (lo + i < N) ? v[lo + i] : 0.f;
+            const float send = upper ? v[i] : hi;
+            const float keep = upper ? hi : v[i];
+            v[i]             = keep + __shfl_xor_sync(0xffffffffu, send, MASK);
+        }
+        reduceScatterLevel<lo, MASK / 2>(v, lane);
+    }
+}
+
+template<int NV>
+inline __device__ float warpReduceScatter(float (&v)[16], const uint32_t lane)
+{
+    static_assert(NV >= 1 && NV <= 16, "1..16 values");
+    reduceScatterLevel<NV, 16>(v, lane);
+    return v[0] + __shfl_xor_sync(0xffffffffu, v[0], 1);
+}
+
+template<int NV>
+inline __device__ int reduce_scatter_index(const uint32_t lane)
+{
+    int start = 0, n = NV, r = NV; // r: real (non-padding) values at the front of the list
+#    pragma unroll
+    for(uint32_t mask = 16; mask >= 2; mask >>= 1)
+    {
+        const int lo = (n + 1) / 2;
+        if(lane & mask)
+        {
+            start += lo;
+            r      = r > lo ? r - lo : 0;
+        }
+        else
+        {
+            r = r < lo ? r : lo;
+        }
+        n = lo;
+    }
+    return r > 0 ? start : -1;
+}
+
 template<class WarpT>
 inline __device__ void warpSum(float &val, WarpT &warp)
 {

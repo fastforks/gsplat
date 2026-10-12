@@ -322,6 +322,278 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     }
 }
 
+// Backward for 16x16 tiles with PPT pixels per thread (128 threads for PPT=2).
+// Each warp covers an 8 x (4 * PPT) pixel patch (lane -> 8x4 sub-patch, pixel p
+// adds 4 * p rows). A thread first sums its pixels' contributions to a
+// gaussian's gradient in registers, so the warp reduction, the global atomics
+// and the per-gaussian loop overhead are shared by 32 * PPT pixels. Per-pixel
+// math is identical to rasterize_to_pixels_3dgs_bwd_kernel. ABS: also
+// accumulate |d means2d| (absgrad); the reduce-scatter then covers CDIM + 8
+// values instead of CDIM + 6.
+template<uint32_t CDIM, uint32_t PPT, bool ABS>
+__global__ void __launch_bounds__(256 / PPT, 8) rasterize_to_pixels_3dgs_bwd_ppt_kernel(
+    const uint32_t I,
+    const int64_t n_isects,
+    const vec2 *__restrict__ means2d,
+    const vec3 *__restrict__ conics,
+    const float *__restrict__ colors,
+    const float *__restrict__ opacities,
+    const float *__restrict__ backgrounds,
+    const bool *__restrict__ masks,
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_width,
+    const uint32_t tile_height,
+    const int64_t *__restrict__ tile_offsets,
+    const int32_t *__restrict__ flatten_ids,
+    const float *__restrict__ render_alphas,
+    const int32_t *__restrict__ last_ids,
+    const float *__restrict__ v_render_colors,
+    const float *__restrict__ v_render_alphas,
+    float *__restrict__ v_means2d_abs,
+    float *__restrict__ v_means2d,
+    float *__restrict__ v_conics,
+    float *__restrict__ v_colors,
+    float *__restrict__ v_opacities
+)
+{
+    static_assert(CDIM + 8 <= 16, "reduce-scatter path needs CDIM + 8 <= 16");
+    static_assert(PPT == 2 || PPT == 4, "patch mapping supports PPT 2 (8x8 per warp) or 4 (8x16 per warp)");
+    constexpr uint32_t TILE = 16, BLOCK = TILE * TILE / PPT;
+    auto block                     = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    const uint32_t image_id        = blockIdx.x / (tile_width * tile_height);
+    const uint32_t tile_id         = blockIdx.x % (tile_width * tile_height);
+    const uint32_t tile_y = tile_id / tile_width, tile_x = tile_id % tile_width;
+
+    tile_offsets    += image_id * tile_height * tile_width;
+    render_alphas   += image_id * image_height * image_width;
+    last_ids        += image_id * image_height * image_width;
+    v_render_colors += image_id * image_height * image_width * CDIM;
+    v_render_alphas += image_id * image_height * image_width;
+    if(backgrounds != nullptr)
+    {
+        backgrounds += image_id * CDIM;
+    }
+    if(masks != nullptr)
+    {
+        masks += image_id * tile_height * tile_width;
+        if(!masks[tile_id])
+        {
+            return;
+        }
+    }
+
+    const uint32_t tr   = block.thread_rank();
+    const uint32_t lane = tr % 32, w = tr / 32;
+    const uint32_t lx   = (w % 2) * 8 + lane % 8;
+    const uint32_t ly0  = (w / 2) * (4 * PPT) + lane / 8; // pixel p is at row ly0 + 4 * p
+
+    float px[PPT], py[PPT], T_final[PPT], T[PPT], buffer[PPT][CDIM], v_render_c[PPT][CDIM], v_render_a[PPT];
+    int32_t bin_final[PPT];
+    bool inside[PPT];
+    int32_t warp_bin_final = 0;
+#    pragma unroll
+    for(uint32_t p = 0; p < PPT; ++p)
+    {
+        const uint32_t i     = tile_y * TILE + ly0 + 4 * p;
+        const uint32_t j     = tile_x * TILE + lx;
+        px[p]                = (float)j + 0.5f;
+        py[p]                = (float)i + 0.5f;
+        inside[p]            = (i < image_height && j < image_width);
+        // pixels outside the image read a valid pixel and are then ignored
+        const int32_t pix_id = min(i * image_width + j, image_width * image_height - 1);
+        T_final[p]           = 1.0f - render_alphas[pix_id];
+        T[p]                 = T_final[p];
+        bin_final[p]         = inside[p] ? last_ids[pix_id] : 0;
+#    pragma unroll
+        for(uint32_t k = 0; k < CDIM; ++k)
+        {
+            buffer[p][k]     = 0.f;
+            v_render_c[p][k] = v_render_colors[pix_id * CDIM + k];
+        }
+        v_render_a[p]  = v_render_alphas[pix_id];
+        warp_bin_final = max(warp_bin_final, bin_final[p]);
+    }
+    warp_bin_final = cg::reduce(warp, warp_bin_final, cg::greater<int>());
+
+    const int64_t range_start = tile_offsets[tile_id];
+    const int64_t range_end
+        = (image_id == I - 1) && (tile_id == tile_width * tile_height - 1) ? n_isects : tile_offsets[tile_id + 1];
+    const int64_t num_intersections = range_end - range_start;
+    const int64_t num_batches       = (num_intersections + BLOCK - 1) / BLOCK;
+
+    __shared__ int32_t id_batch[BLOCK];
+    // Per-gaussian data packed for wide shared-memory loads:
+    // pk0 = (x, y, opacity, conic.x), pk1 = (conic.y, conic.z, rgb0, rgb1).
+    __shared__ float4 pk0_batch[BLOCK];
+    __shared__ float4 pk1_batch[BLOCK];
+    __shared__ float rgbs_batch[BLOCK * CDIM];
+
+    // Gradient component this lane pair holds after the reduce-scatter:
+    // colors[CDIM], conic[3], means2d[2], [abs means2d[2]], opacity.
+    constexpr int NV = CDIM + (ABS ? 8 : 6);
+    const int rs_c   = reduce_scatter_index<NV>(lane);
+    float *out_ptr   = nullptr;
+    int32_t out_stride = 0;
+    if(rs_c >= 0 && rs_c < (int)CDIM)
+    {
+        out_ptr = v_colors + rs_c, out_stride = CDIM;
+    }
+    else if(rs_c >= 0 && rs_c < (int)CDIM + 3)
+    {
+        out_ptr = v_conics + (rs_c - CDIM), out_stride = 3;
+    }
+    else if(rs_c >= 0 && rs_c < (int)CDIM + 5)
+    {
+        out_ptr = v_means2d + (rs_c - CDIM - 3), out_stride = 2;
+    }
+    else if(rs_c >= 0 && rs_c < NV - 1)
+    {
+        out_ptr = v_means2d_abs + (rs_c - CDIM - 5), out_stride = 2;
+    }
+    else if(rs_c == NV - 1)
+    {
+        out_ptr = v_opacities, out_stride = 1;
+    }
+
+    float bg_dot[PPT];
+#    pragma unroll
+    for(uint32_t p = 0; p < PPT; ++p)
+    {
+        float accum = 0.f;
+        if(backgrounds != nullptr)
+        {
+#    pragma unroll
+            for(uint32_t k = 0; k < CDIM; ++k)
+            {
+                accum += backgrounds[k] * v_render_c[p][k];
+            }
+        }
+        bg_dot[p] = accum;
+    }
+
+    for(int64_t b = 0; b < num_batches; ++b)
+    {
+        block.sync();
+        // load gaussians in back-to-front order
+        const int64_t batch_end_offset = num_intersections - 1 - BLOCK * b;
+        const int64_t remaining        = batch_end_offset + 1;
+        const uint32_t batch_size      = static_cast<uint32_t>(remaining < BLOCK ? remaining : BLOCK);
+        const int64_t idx              = range_start + batch_end_offset - tr;
+        if(idx >= range_start)
+        {
+            const int32_t g = flatten_ids[idx];
+            id_batch[tr]    = g;
+            const vec2 xy   = means2d[g];
+            const vec3 cn   = conics[g];
+#    pragma unroll
+            for(uint32_t k = 0; k < CDIM; ++k)
+            {
+                rgbs_batch[tr * CDIM + k] = colors[g * CDIM + k];
+            }
+            pk0_batch[tr] = make_float4(xy.x, xy.y, opacities[g], cn.x);
+            pk1_batch[tr] = make_float4(cn.y, cn.z, colors[g * CDIM], CDIM > 1 ? colors[g * CDIM + 1] : 0.f);
+        }
+        block.sync();
+        // skip gaussians behind the last contributor of every pixel of the warp
+        const int64_t first_t64 = batch_end_offset > warp_bin_final ? batch_end_offset - warp_bin_final : 0;
+        const uint32_t first_t  = first_t64 < batch_size ? static_cast<uint32_t>(first_t64) : batch_size;
+        for(uint32_t t = first_t; t < batch_size; ++t)
+        {
+            const float4 a0  = pk0_batch[t];
+            const float4 a1  = pk1_batch[t];
+            const vec3 conic = {a0.w, a1.x, a1.y};
+            const float opac = a0.z;
+            float rgb_t[CDIM];
+#    pragma unroll
+            for(uint32_t k = 0; k < CDIM; ++k)
+            {
+                rgb_t[k] = k == 0 ? a1.z : (k == 1 ? a1.w : rgbs_batch[t * CDIM + k]);
+            }
+            bool valid[PPT];
+            float alpha[PPT], vis[PPT];
+            vec2 delta[PPT];
+            bool any_valid = false;
+#    pragma unroll
+            for(uint32_t p = 0; p < PPT; ++p)
+            {
+                valid[p] = inside[p] && !(batch_end_offset - t > bin_final[p]);
+                if(valid[p])
+                {
+                    delta[p]                = {a0.x - px[p], a0.y - py[p]};
+                    const GaussianWeight gw = eval_gaussian_weight(conic, delta[p].x, delta[p].y, opac);
+                    vis[p]                  = gw.vis;
+                    alpha[p]                = gw.alpha;
+                    valid[p]                = gw.valid;
+                }
+                any_valid |= valid[p];
+            }
+            if(!warp.any(any_valid))
+            {
+                continue;
+            }
+            float vals[16];
+#    pragma unroll
+            for(uint32_t k = 0; k < 16; ++k)
+            {
+                vals[k] = 0.f;
+            }
+#    pragma unroll
+            for(uint32_t p = 0; p < PPT; ++p)
+            {
+                if(!valid[p])
+                {
+                    continue;
+                }
+                const float ra  = 1.0f / fmaxf(MIN_ONE_MINUS_ALPHA, 1.0f - alpha[p]);
+                T[p]           *= ra;
+                const float fac = alpha[p] * T[p];
+                float v_alpha   = 0.f;
+#    pragma unroll
+                for(uint32_t k = 0; k < CDIM; ++k)
+                {
+                    vals[k] += fac * v_render_c[p][k];
+                    v_alpha += (rgb_t[k] * T[p] - buffer[p][k] * ra) * v_render_c[p][k];
+                }
+                v_alpha += T_final[p] * ra * v_render_a[p];
+                if(backgrounds != nullptr)
+                {
+                    v_alpha += -T_final[p] * ra * bg_dot[p];
+                }
+                if(opac * vis[p] <= MAX_ALPHA)
+                {
+                    const float v_sigma = -opac * vis[p] * v_alpha;
+                    const float dx = delta[p].x, dy = delta[p].y;
+                    vals[CDIM + 0] += 0.5f * v_sigma * dx * dx;
+                    vals[CDIM + 1] += v_sigma * dx * dy;
+                    vals[CDIM + 2] += 0.5f * v_sigma * dy * dy;
+                    const float gx  = v_sigma * (conic.x * dx + conic.y * dy);
+                    const float gy  = v_sigma * (conic.y * dx + conic.z * dy);
+                    vals[CDIM + 3] += gx;
+                    vals[CDIM + 4] += gy;
+                    if constexpr(ABS)
+                    {
+                        vals[CDIM + 5] += fabsf(gx);
+                        vals[CDIM + 6] += fabsf(gy);
+                    }
+                    vals[NV - 1] += vis[p] * v_alpha;
+                }
+#    pragma unroll
+                for(uint32_t k = 0; k < CDIM; ++k)
+                {
+                    buffer[p][k] += rgb_t[k] * fac;
+                }
+            }
+            const float sum = warpReduceScatter<NV>(vals, lane);
+            if((lane & 1) == 0 && out_ptr != nullptr)
+            {
+                atomicAdd_system(out_ptr + static_cast<int64_t>(id_batch[t]) * out_stride, sum);
+            }
+        }
+    }
+}
+
 void launch_rasterize_to_pixels_3dgs_bwd_kernel(
     // Gaussian parameters
     const at::Tensor means2d,                   // [..., N, 2] or [nnz, 2]
@@ -383,6 +655,55 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
     auto launch_kernel = [&]<typename ChannelsT>()
     {
         constexpr uint32_t CDIM = ChannelsT::value;
+
+        // 16x16 tiles with up to 8 channels: 2 pixels per thread (see
+        // rasterize_to_pixels_3dgs_bwd_ppt_kernel). Other cases fall through.
+        if constexpr(CDIM + 8 <= 16)
+        {
+            if(tile_size == 16)
+            {
+                constexpr uint32_t PPT = 2;
+                auto launch_ppt        = [&]<bool ABS>()
+                {
+                    rasterize_to_pixels_3dgs_bwd_ppt_kernel<CDIM, PPT, ABS>
+                        <<<n_tiles, 256 / PPT, 0, at::cuda::getCurrentCUDAStream()>>>(
+                            I,
+                            n_isects,
+                            reinterpret_cast<const vec2 *>(means2d.const_data_ptr<float>()),
+                            reinterpret_cast<const vec3 *>(conics.const_data_ptr<float>()),
+                            colors.const_data_ptr<float>(),
+                            opacities.const_data_ptr<float>(),
+                            backgrounds.has_value() ? backgrounds.value().const_data_ptr<float>() : nullptr,
+                            masks.has_value() ? masks.value().const_data_ptr<bool>() : nullptr,
+                            image_width,
+                            image_height,
+                            tile_width,
+                            tile_height,
+                            tile_offsets.const_data_ptr<int64_t>(),
+                            flatten_ids.const_data_ptr<int32_t>(),
+                            render_alphas.const_data_ptr<float>(),
+                            last_ids.const_data_ptr<int32_t>(),
+                            v_render_colors.const_data_ptr<float>(),
+                            v_render_alphas.const_data_ptr<float>(),
+                            v_means2d_abs.has_value() ? v_means2d_abs.value().data_ptr<float>() : nullptr,
+                            v_means2d.data_ptr<float>(),
+                            v_conics.data_ptr<float>(),
+                            v_colors.data_ptr<float>(),
+                            v_opacities.data_ptr<float>()
+                        );
+                };
+                if(v_means2d_abs.has_value())
+                {
+                    launch_ppt.template operator()<true>();
+                }
+                else
+                {
+                    launch_ppt.template operator()<false>();
+                }
+                C10_CUDA_KERNEL_LAUNCH_CHECK();
+                return;
+            }
+        }
 
         int64_t shmem_size
             = tile_size * tile_size * (sizeof(int32_t) + sizeof(vec3) + sizeof(vec3) + sizeof(float) * CDIM);
