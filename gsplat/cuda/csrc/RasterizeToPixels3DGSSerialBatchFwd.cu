@@ -400,9 +400,18 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
         // register footprint scales with 4*CDIM and spills to local memory at high
         // channel counts (~10x slower forward at CDIM=128). PPT=1 makes register
         // pressure scale with CDIM alone; it is parity at CDIM=3 (see issue #8).
+        // For CDIM <= 8, 4 pixels per thread (CTA=64) is faster: each gaussian
+        // loaded from shared memory serves more pixels.
         if(tile_size == 16)
         {
-            launch_variant.template operator()<16, 256>();
+            if constexpr(CDIM <= 8)
+            {
+                launch_variant.template operator()<16, 64>();
+            }
+            else
+            {
+                launch_variant.template operator()<16, 256>();
+            }
         }
         else if(tile_size == 4)
         {
