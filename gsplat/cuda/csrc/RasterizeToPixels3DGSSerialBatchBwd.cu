@@ -38,6 +38,43 @@ using SupportedChannels = dispatch::IntParam<GSPLAT_NUM_CHANNELS>;
 
 namespace cg = cooperative_groups;
 
+// Sums one gaussian's per-lane gradient values over the warp with a single
+// reduce-scatter and adds the totals with parallel atomics (one lane per
+// value). Values: CDIM colors, conic xx/xy/yy, means2d x/y, then |means2d| x/y
+// if NV == CDIM + 8, then opacity.
+template<uint32_t CDIM, int NV>
+inline __device__ void reduce_scatter_add_grads(
+    float (&vals)[16],
+    const uint32_t lane,
+    const int64_t g,
+    float *v_colors,
+    float *v_conics,
+    float *v_means2d,
+    float *v_means2d_abs,
+    float *v_opacities
+)
+{
+    constexpr int C   = CDIM;
+    const float sum   = warpReduceScatter<NV>(vals, lane);
+    const int c       = reduce_scatter_index<NV>(lane);
+    if((lane & 1) != 0 || c < 0)
+    {
+        return;
+    }
+    float *ptr;
+    if(c < C)
+        ptr = v_colors + C * g + c;
+    else if(c < C + 3)
+        ptr = v_conics + 3 * g + (c - C);
+    else if(c < C + 5)
+        ptr = v_means2d + 2 * g + (c - C - 3);
+    else if(c < NV - 1)
+        ptr = v_means2d_abs + 2 * g + (c - C - 5);
+    else
+        ptr = v_opacities + g;
+    atomicAdd_system(ptr, sum);
+}
+
 template<uint32_t CDIM, typename scalar_t>
 __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     const uint32_t I,
@@ -280,6 +317,53 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
                 for(uint32_t k = 0; k < CDIM; ++k)
                 {
                     buffer[k] += rgbs_batch[t * CDIM + k] * fac;
+                }
+            }
+            // tile_size 8 and 16 blocks consist of whole warps: reduce all
+            // gradient values with one reduce-scatter instead of one warp
+            // reduction per value (tile_size 4 launches 16-thread blocks).
+            if constexpr(CDIM + 8 <= 16)
+            {
+                if(block.size() % 32 == 0)
+                {
+                    float vals[16];
+#    pragma unroll
+                    for(uint32_t k = 0; k < 16; ++k)
+                    {
+                        vals[k] = 0.f;
+                    }
+#    pragma unroll
+                    for(uint32_t k = 0; k < CDIM; ++k)
+                    {
+                        vals[k] = v_rgb_local[k];
+                    }
+                    vals[CDIM + 0]       = v_conic_local.x;
+                    vals[CDIM + 1]       = v_conic_local.y;
+                    vals[CDIM + 2]       = v_conic_local.z;
+                    vals[CDIM + 3]       = v_xy_local.x;
+                    vals[CDIM + 4]       = v_xy_local.y;
+                    const uint32_t lane  = warp.thread_rank();
+                    const int64_t g      = id_batch[t];
+                    float *const vc      = (float *)v_conics;
+                    float *const vm      = (float *)v_means2d;
+                    float *const vm_abs  = (float *)v_means2d_abs;
+                    if(v_means2d_abs != nullptr)
+                    {
+                        vals[CDIM + 5] = v_xy_abs_local.x;
+                        vals[CDIM + 6] = v_xy_abs_local.y;
+                        vals[CDIM + 7] = v_opacity_local;
+                        reduce_scatter_add_grads<CDIM, CDIM + 8>(
+                            vals, lane, g, v_colors, vc, vm, vm_abs, v_opacities
+                        );
+                    }
+                    else
+                    {
+                        vals[CDIM + 5] = v_opacity_local;
+                        reduce_scatter_add_grads<CDIM, CDIM + 6>(
+                            vals, lane, g, v_colors, vc, vm, vm_abs, v_opacities
+                        );
+                    }
+                    continue;
                 }
             }
             warpSum<CDIM>(v_rgb_local, warp);
