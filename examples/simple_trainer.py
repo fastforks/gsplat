@@ -966,10 +966,11 @@ class Runner:
         if cfg.cache_images:
             # before the loader starts its workers, which then share the cache
             self.trainset.preload_images()
-        if cfg.cache_images and cfg.num_workers == 0:
+        if cfg.cache_images and cfg.num_workers == 0 and cfg.patch_size is None:
             # Keep the decoded training set on the GPU: no worker processes, no
             # per-step IPC / pinning (which also contend for the GIL with the
-            # training loop) and no host-to-device copies.
+            # training loop) and no host-to-device copies. Random crops must
+            # use the DataLoader so each visit samples a new patch.
             trainloader = _DeviceCachedLoader(self.trainset, cfg.batch_size, device)
         else:
             trainloader = torch.utils.data.DataLoader(
