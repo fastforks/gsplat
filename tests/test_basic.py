@@ -8240,3 +8240,89 @@ def test_rasterize_to_pixels_eval3d_empty():
     torch.testing.assert_close(render_normals, torch.zeros_like(render_normals))
     torch.testing.assert_close(last_ids, torch.full_like(last_ids, -1))
     torch.testing.assert_close(sample_counts, torch.zeros_like(sample_counts))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")
+@pytest.mark.skipif(not gsplat.has_3dgs(), reason="3DGS support isn't built in")
+@pytest.mark.parametrize("channels", [3, 8])
+@pytest.mark.parametrize("packed", [False, True])
+def test_rasterize_to_pixels_multi_pixel(test_data, channels: int, packed: bool):
+    # 16x16 tiles with CDIM <= 8 use the multi-pixel-per-thread kernels, dense
+    # and packed. Values and gradients are checked against the PyTorch
+    # reference; absgrad (not in the reference) against tile_size=4, which
+    # uses the one-pixel-per-thread kernels.
+    from gsplat.cuda._torch_impl import _rasterize_to_pixels
+    from gsplat.cuda._wrapper import (
+        fully_fused_projection,
+        isect_offset_encode,
+        isect_tiles,
+        quat_scale_to_covar_preci,
+        rasterize_to_pixels,
+    )
+
+    torch.manual_seed(42)
+    C, N = test_data["viewmats"].shape[0], test_data["means"].shape[0]
+    width, height = test_data["width"], test_data["height"]
+    covars, _ = quat_scale_to_covar_preci(
+        test_data["quats"], test_data["scales"] * 0.1, compute_preci=False, triu=True
+    )
+    radii, means2d, depths, conics, _ = fully_fused_projection(
+        test_data["means"], covars, None, None, test_data["viewmats"], test_data["Ks"], width, height
+    )
+    colors = torch.rand(C, N, channels, device=device)
+    opacities = test_data["opacities"].expand(C, N).contiguous()
+    leaves = [x.detach().clone().requires_grad_(True) for x in (means2d, conics, colors, opacities)]
+    cam_ids, gs_ids = torch.nonzero((radii > 0).all(-1), as_tuple=True)
+    v_colors = torch.randn(C, height, width, channels, device=device)
+    v_alphas = torch.randn(C, height, width, 1, device=device)
+
+    def run(tile_size, reference=False):
+        tw, th = math.ceil(width / tile_size), math.ceil(height / tile_size)
+        if packed and not reference:
+            inputs = [x[cam_ids, gs_ids] for x in leaves]
+            _, isect_ids, flatten_ids = isect_tiles(
+                inputs[0], radii[cam_ids, gs_ids], depths[cam_ids, gs_ids], tile_size, tw, th,
+                packed=True, n_images=C, image_ids=cam_ids, gaussian_ids=gs_ids,
+            )
+        else:
+            inputs = leaves
+            _, isect_ids, flatten_ids = isect_tiles(means2d, radii, depths, tile_size, tw, th)
+        offsets = isect_offset_encode(isect_ids, C, tw, th)
+        if reference:
+            out = _rasterize_to_pixels(*inputs, width, height, tile_size, offsets, flatten_ids)
+        else:
+            out = rasterize_to_pixels(
+                *inputs, width, height, tile_size, offsets, flatten_ids, packed=packed, absgrad=True
+            )
+        grads = torch.autograd.grad((out[0] * v_colors).sum() + (out[1] * v_alphas).sum(), leaves)
+        absgrad = None
+        if not reference:
+            absgrad = torch.zeros(C, N, 2, device=device)
+            if packed:
+                absgrad[cam_ids, gs_ids] = inputs[0].absgrad
+            else:
+                absgrad = inputs[0].absgrad
+        return [o.detach() for o in out], grads, absgrad
+
+    (render, alpha), grads, absgrad = run(16)
+    (_render, _alpha), _grads, _ = run(16, reference=True)
+    torch.testing.assert_close(render, _render)
+    torch.testing.assert_close(alpha, _alpha)
+    for name, vc, vt, atol in zip(
+        ("v_means2d", "v_conics", "v_colors", "v_opacities"), grads, _grads, (1.6e-3, 1e-3, 1e-3, 2e-3)
+    ):
+        assert torch.isfinite(vc).all(), f"{name}: CUDA produced NaN/Inf"
+        nz_thresh = vt.abs().max().item() * 1e-5
+        assert_close_with_boundary_band(
+            vc,
+            vt,
+            boundary_mask=vt.abs() < nz_thresh,
+            interior_atol=atol,
+            interior_rtol=2.5e-4,
+            boundary_max_flip_ratio=1e-3,
+            boundary_symmetry_tol=0.5,
+            flip_predicate=lambda a, e, _t=nz_thresh: a.abs() > 10 * _t,
+            msg=f"{name} backward (multi-pixel rasterize)",
+        )
+    _, _, absgrad_t4 = run(4)
+    torch.testing.assert_close(absgrad, absgrad_t4, rtol=1e-4, atol=1e-4)
