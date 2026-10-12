@@ -412,6 +412,11 @@ class Runner:
         set_random_seed(42 + local_rank)
 
         self.cfg = cfg
+        if cfg.fused_shn_adam or cfg.fused_sh_colors or cfg.lazy_sh_adam:
+            if world_size != 1:
+                raise ValueError("fused training optimizers support single-process training only")
+            if cfg.pose_opt:
+                raise ValueError("fused SH optimizers do not support pose optimization")
         if cfg.lazy_sh_adam:
             assert not cfg.packed and cfg.camera_model == "pinhole" and not cfg.with_ut and not cfg.with_eval3d
             assert isinstance(cfg.strategy, DefaultStrategy), "lazy_sh_adam supports DefaultStrategy"

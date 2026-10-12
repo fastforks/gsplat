@@ -51,6 +51,8 @@ def spherical_harmonics_l1_plus_fused_adam(
     ``optimizer`` must be a ``torch.optim.Adam`` holding only ``shN`` with
     ``weight_decay=0`` and ``amsgrad=False``. Call this once per optimizer step.
     """
+    if torch.is_grad_enabled() and viewmats.requires_grad:
+        raise ValueError("fused SH Adam does not support camera gradients")
     (group,) = optimizer.param_groups
     assert group.get("weight_decay", 0) == 0 and not group.get("amsgrad", False)
     assert not group.get("maximize", False)
@@ -129,6 +131,8 @@ def sh_colors_fused_adam(
     """
     if not torch.is_grad_enabled():
         return _make_lazy_cuda_func("sh_colors_fused_fwd")(degree, means.contiguous(), viewmats.contiguous(), sh0, shN)
+    if viewmats.requires_grad:
+        raise ValueError("fused SH Adam does not support camera gradients")
     return _SHColorsFusedAdam.apply(degree, means, viewmats.contiguous(), sh0, shN, opt_sh0, opt_shN)
 
 
@@ -234,6 +238,10 @@ class LazySHAdam:
         if not torch.is_grad_enabled():
             self.catch_up()
             return _make_lazy_cuda_func("sh_colors_fused_fwd")(degree, means.contiguous(), viewmats, sh0, shN)
+        if mask is None:
+            mask = torch.ones((viewmats.shape[0], means.shape[0]), dtype=torch.bool, device=means.device)
+        if viewmats.requires_grad:
+            raise ValueError("lazy SH Adam does not support camera gradients")
         return _LazySHColors.apply(self, degree, means, viewmats, mask.contiguous(), sh0, shN)
 
     def _args(self, step: int, device):

@@ -1435,7 +1435,7 @@ void launch_spherical_harmonics_l1_plus_bwd_adam_kernel(
     {
         return;
     }
-    TORCH_CHECK(D >= 1 && D <= 256, "fused SH Adam supports 1..256 channels");
+    TORCH_CHECK(D >= 1 && D <= SH_FUSED_MAX_D, "fused SH Adam supports 1..4 channels");
     // Multiple of 4 rows keeps every block's slab 16-byte aligned for float4.
     const uint32_t rows_per_block = 256 / D >= 4 ? (256 / D) / 4 * 4 : 256 / D;
     const unsigned int threads    = rows_per_block * D;
