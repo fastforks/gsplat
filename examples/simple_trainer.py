@@ -459,9 +459,10 @@ class Runner:
         set_random_seed(42 + local_rank)
 
         self.cfg = cfg
-        if cfg.fused_shn_adam or cfg.fused_sh_colors or cfg.lazy_sh_adam:
+        if cfg.fused_shn_adam or cfg.fused_sh_colors or cfg.lazy_sh_adam or cfg.fused_geometry_adam:
             if world_size != 1:
                 raise ValueError("fused training optimizers support single-process training only")
+        if cfg.fused_shn_adam or cfg.fused_sh_colors or cfg.lazy_sh_adam:
             if cfg.pose_opt:
                 raise ValueError("fused SH optimizers do not support pose optimization")
         if cfg.fused_geometry_adam:

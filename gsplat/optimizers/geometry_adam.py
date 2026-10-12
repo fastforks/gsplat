@@ -67,6 +67,8 @@ class GeometryAdam:
         ``means`` / ``opacities`` are the (activated) tensors for the other
         consumers, whose gradients are added as in ``activate``."""
         assert torch.is_grad_enabled() and viewmats.shape[0] == 1 and means.dim() == 2
+        if viewmats.requires_grad or Ks.requires_grad:
+            raise ValueError("fused projection Adam does not support camera gradients")
         return _ProjectGeomAdam.apply(
             self, means, quats, log_scales, opacity_logits, viewmats.contiguous(), Ks.contiguous(),
             width, height, eps2d, near_plane, far_plane, tile_size,
