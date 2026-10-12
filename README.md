@@ -1,3 +1,38 @@
+# gsplat: faster 3DGS training fork
+
+> **You are on `cuda-kernels`.** Research fork of [nerfstudio-project/gsplat](https://github.com/nerfstudio-project/gsplat) (base `512d366b`, 2026-09-19; `main` mirrors upstream). One branch: gsplat is a CUDA library, so there is no plain-PyTorch tier. Every change is opt-in through a `simple_trainer.py` flag; without the flags training runs the upstream code paths.
+> Licence, as upstream: Apache-2.0 ([LICENSE](LICENSE)). Changed files (Apache-2.0 §4(b)): `examples/simple_trainer.py`, `examples/datasets/colmap.py`, `examples/requirements.txt`, `gsplat/strategy/{default,ops}.py`, `gsplat/cuda/_wrapper.py`, `gsplat/cuda/ext.cpp`, and in `gsplat/cuda/csrc` / `include`: `Intersect.cpp`, `IntersectTile.cu`, `Rasterization.cpp`, `RasterizeToPixels3DGSSerialBatch{Fwd,Bwd}.cu`, `SphericalHarmonics{.cpp,.h,L1PlusCUDA.cu}`, `Utils.cuh`. New files: `gsplat/optimizers/{fused_sh_adam,geometry_adam}.py`, `gsplat/cuda/csrc/{GeometryAdamCUDA,StrategyCUDA}.cu`, `gsplat/cuda/include/AccuTile.cuh`, tests `tests/test_fused_training.py`. The commit history lists each change.
+
+```bash
+pip install -r examples/requirements.txt   # pins fastforks/fused-ssim (fused L1 + SSIM)
+F="--split_sh --lazy_sh_adam --fused_geometry_adam --fused_projection_adam --fused_l1_ssim --cache_images --num_workers 0 --fused_strategy_stats --expandable_segments"
+python examples/simple_trainer.py default --data_dir data/360_v2/garden --data_factor 4 $F            # exact (fp32 Adam state)
+python examples/simple_trainer.py default --data_dir data/360_v2/garden --data_factor 4 $F --sh_adam_bf16 --geo_adam_bf16   # max: bf16 Adam moments
+```
+
+What the flags do:
+- rasterizer backward: 2 or 4 pixels per thread and reduce-scatter warp reductions;
+- spherical harmonics evaluated from `sh0` / `shN` without the concat;
+- exact deferred (lazy) Adam for the SH coefficients;
+- Adam for means / quats / scales / opacities fused into the projection backward;
+- densification statistics without boolean indexing;
+- L1 + SSIM in one fused-ssim pass;
+- training images cached on the GPU, with the DataLoader's shuffle order reproduced.
+
+Also: `--grey` / `--eval_grey` for 1-channel training. Limits: the fused paths cover up to 4 colour channels, dense (non-packed) rendering, batch 1, fp32 parameters, `DefaultStrategy` and pinhole cameras. Other settings keep the upstream path or stop with an error.
+
+MipNeRF-360 garden, `--data_factor 4`, 7k steps, seed 42, same image order as upstream; RTX 5060 Ti 16 GB, torch 2.14.1+cu130, 2026-10-12. Time = training loop (eval excluded); memory = torch peak allocated / reserved during training; PSNR / SSIM / LPIPS on the test views at 7k; median of 2 runs.
+
+| version | train 7k s | speed-up | peak GB alloc / reserved | startup s (import / setup / first step) | PSNR | SSIM | LPIPS | #GS |
+|---|---|---|---|---|---|---|---|---|
+| upstream `512d366b` | 223.6 | 1.00x | 3.93 / 6.29 | 3.1 / 2.1 / 5.8 | 26.24 | 0.813 | 0.147 | 2.60M |
+| **cuda-kernels**, exact | 73.5 | 3.04x | 4.35 / 5.41 | 2.1 / 2.9 / 6.2 | 26.21 | 0.813 | 0.147 | 2.58M |
+| **cuda-kernels**, max (bf16 Adam moments) | 69.1 | 3.24x | 3.37 / 4.02 | 2.1 / 2.9 / 6.2 | 26.25 | 0.813 | 0.146 | 2.60M |
+
+Peak allocated memory for exact includes the training images cached on the GPU (`--cache_images`). Run-to-run PSNR noise on this scene is about ±0.04 dB (float atomics). A 30k-step check of an earlier state of this branch: 2.71x, PSNR 27.76 vs 27.74 upstream. Tests: `pytest tests/test_fused_training.py` (parity with the PyTorch reference). Raw rows, commands and commits: the results directory `2026-10-12_gsplat_release` of the research workspace (not part of this repo).
+
+---
+
 # gsplat
 
 [![Core Tests.](https://github.com/nerfstudio-project/gsplat/actions/workflows/core_tests.yml/badge.svg?branch=main)](https://github.com/nerfstudio-project/gsplat/actions/workflows/core_tests.yml)
