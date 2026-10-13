@@ -59,6 +59,10 @@ from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization, RasterizeMode
+try:
+    from fused_ssim import fused_l1_ssim
+except ImportError:  # fused-ssim without fused_l1_ssim
+    fused_l1_ssim = None
 
 try:
     from gsplat.scene import GaussianScene
@@ -165,6 +169,9 @@ class Config:
     # Cast SH coefficients to fp16 before feeding the SH kernel.
     # Parameters and Adam state stay fp32.
     sh_fp16: bool = False
+
+    # Compute the L1 and SSIM losses in one fused-ssim pass (same gradients).
+    fused_l1_ssim: bool = False
     # Turn on another SH degree every this steps
     sh_degree_interval: int = 1000
     # Initial opacity of GS
@@ -391,6 +398,8 @@ class Runner:
         set_random_seed(42 + local_rank)
 
         self.cfg = cfg
+        if cfg.fused_l1_ssim:
+            assert fused_l1_ssim is not None, "--fused_l1_ssim needs a fused-ssim version with fused_l1_ssim"
         self.world_rank = world_rank
         self.local_rank = local_rank
         self.world_size = world_size
@@ -962,12 +971,21 @@ class Runner:
                 colors_ssim = colors * masks[..., None]
                 pixels_ssim = pixels * masks[..., None]
             else:
-                l1loss = l1_loss(colors, pixels).mean()
+                l1loss = None
+                if not self.cfg.fused_l1_ssim:
+                    l1loss = l1_loss(colors, pixels).mean()
                 colors_ssim = colors
                 pixels_ssim = pixels
-            ssimloss = ssim_loss(
-                colors_ssim.permute(0, 3, 1, 2), pixels_ssim.permute(0, 3, 1, 2)
-            )
+            if l1loss is None:
+                # L1 and SSIM in one pass over the images; same gradients.
+                l1loss, ssim_val = fused_l1_ssim(
+                    colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+                )
+                ssimloss = 1.0 - ssim_val
+            else:
+                ssimloss = ssim_loss(
+                    colors_ssim.permute(0, 3, 1, 2), pixels_ssim.permute(0, 3, 1, 2)
+                )
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
             if cfg.depth_loss:
                 # query depths from depth map
