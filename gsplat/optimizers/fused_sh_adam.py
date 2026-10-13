@@ -159,6 +159,9 @@ class LazySHAdam:
         self.last: Tensor = None  # [N] int32, last step applied per row
         self.caught_up_at = 0
         self.tabs: Tensor = None  # [4, T] float32
+        # Optional GeometryAdam (or anything with add_means_grad) that takes the
+        # SH contribution to the means gradient directly.
+        self.means_grad_sink = None
         self._tab_filled = 0  # steps 1.._tab_filled are valid
         self._tab_hparams = None
 
@@ -281,4 +284,9 @@ class _LazySHColors(torch.autograd.Function):
         mgr.step = step
         s0["step"].fill_(float(step))
         sN["step"].fill_(float(step))
+        if v_means is not None and mgr.means_grad_sink is not None:
+            # Autograd still orders this backward before the sink's (the edge to
+            # `means` exists), so the sink sees the contribution in time.
+            mgr.means_grad_sink.add_means_grad(v_means)
+            v_means = None
         return None, None, v_means, None, None, None, None

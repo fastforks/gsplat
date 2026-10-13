@@ -1021,6 +1021,32 @@ TORCH_LIBRARY(gsplat, m)
         "sh_lazy_catchup(Tensor(a!) p, Tensor(b!) m, Tensor(c!) v, Tensor last, int step, Tensor step_size_tab, "
         "Tensor bc2_sqrt_tab, float beta1, float beta2, float eps) -> ()"
     );
+    m.def(
+        "strategy_update_state(Tensor grads, Tensor radii, float sx, float sy, Tensor(a!) grad2d, Tensor(b!) count) -> ()"
+    );
+    m.def(
+        "geometry_adam(Tensor(a!) means, Tensor(b!) means_m, Tensor(c!) means_v, Tensor? g_means, Tensor? g2_means, float[] hp_means, "
+        "Tensor(d!) quats, Tensor(e!) quats_m, Tensor(f!) quats_v, Tensor? g_quats, float[] hp_quats, "
+        "Tensor(g!) scales, Tensor(h!) scales_m, Tensor(i!) scales_v, Tensor? g_scales, Tensor scales_act, float[] hp_scales, "
+        "Tensor(j!) opac, Tensor(k!) opac_m, Tensor(l!) opac_v, Tensor? g_opac, Tensor opac_act, float[] hp_opac) -> ()"
+    );
+    m.def(
+        "projection_geometry_adam(Tensor(a!) means, Tensor(b!) means_m, Tensor(c!) means_v, Tensor? g2_means, float[] hp_means, "
+        "Tensor(d!) quats, Tensor(e!) quats_m, Tensor(f!) quats_v, float[] hp_quats, "
+        "Tensor(g!) scales, Tensor(h!) scales_m, Tensor(i!) scales_v, float[] hp_scales, "
+        "Tensor(j!) opac, Tensor(k!) opac_m, Tensor(l!) opac_v, Tensor? g_opac, float[] hp_opac, "
+        "Tensor viewmats, Tensor Ks, int image_width, int image_height, Tensor radii, Tensor conics, "
+        "Tensor v_means2d, Tensor? v_depths, Tensor v_conics) -> ()"
+    );
+    m.def(
+        "projection_act_fwd(Tensor means, Tensor quats, Tensor log_scales, Tensor logits, Tensor viewmats, "
+        "Tensor Ks, int image_width, int image_height, float eps2d, float near_plane, float far_plane, "
+        "int tile_size, int tile_width, int tile_height) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
+    );
+    m.def(
+        "intersect_tile_counted(Tensor means2d, Tensor radii, Tensor depths, Tensor conics, Tensor opacities, "
+        "Tensor tiles_per_gauss, int tile_size, int tile_width, int tile_height) -> (Tensor, Tensor)"
+    );
     m.def("sh_colors_fused_fwd(int degrees_to_use, Tensor means, Tensor viewmats, Tensor sh0, Tensor shN) -> Tensor");
     m.def(
         "sh_colors_fused_bwd_adam(int degrees_to_use, Tensor means, Tensor viewmats, Tensor(a!) sh0, Tensor(b!) shN, "
