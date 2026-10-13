@@ -121,6 +121,98 @@ void launch_spherical_harmonics_bwd_kernel(
     at::optional<at::Tensor> v_viewmats_rs
 );
 
+void launch_spherical_harmonics_l1_plus_bwd_adam_kernel(
+    const uint32_t degrees_to_use,
+    const at::Tensor means,
+    const at::Tensor viewmats,
+    at::Tensor coeffs,
+    const at::Tensor v_colors,
+    at::Tensor exp_avg,
+    at::Tensor exp_avg_sq,
+    at::optional<at::Tensor> v_means,
+    const float step_size,
+    const float beta1,
+    const float beta2,
+    const float eps,
+    const float bias_correction2_sqrt,
+    at::optional<at::Tensor> sh0,
+    at::optional<at::Tensor> sh0_exp_avg,
+    at::optional<at::Tensor> sh0_exp_avg_sq,
+    const float sh0_step_size,
+    const float sh0_beta1,
+    const float sh0_beta2,
+    const float sh0_eps,
+    const float sh0_bias_correction2_sqrt
+);
+
+void launch_sh_colors_lazy_fwd_kernel(
+    const uint32_t degrees_to_use,
+    const at::Tensor means,
+    const at::Tensor viewmats,
+    const at::Tensor mask,
+    const at::Tensor sh0,
+    const at::Tensor sh0_m,
+    const at::Tensor sh0_v,
+    const at::Tensor shN,
+    const at::Tensor shN_m,
+    const at::Tensor shN_v,
+    const at::Tensor last,
+    const int step,
+    const at::Tensor tabs,
+    const float sh0_beta1,
+    const float sh0_beta2,
+    const float sh0_eps,
+    const float shN_beta1,
+    const float shN_beta2,
+    const float shN_eps,
+    at::Tensor colors
+);
+
+void launch_sh_colors_lazy_bwd_adam_kernel(
+    const uint32_t degrees_to_use,
+    const at::Tensor means,
+    const at::Tensor viewmats,
+    const at::Tensor v_colors,
+    at::Tensor sh0,
+    at::Tensor sh0_m,
+    at::Tensor sh0_v,
+    at::Tensor shN,
+    at::Tensor shN_m,
+    at::Tensor shN_v,
+    at::Tensor last,
+    const int step,
+    const at::Tensor tabs,
+    const float sh0_beta1,
+    const float sh0_beta2,
+    const float sh0_eps,
+    const float shN_beta1,
+    const float shN_beta2,
+    const float shN_eps,
+    at::optional<at::Tensor> v_means
+);
+
+void launch_sh_lazy_catchup_kernel(
+    at::Tensor p,
+    at::Tensor m,
+    at::Tensor v,
+    const at::Tensor last,
+    const int step,
+    const at::Tensor step_size_tab,
+    const at::Tensor bc2_sqrt_tab,
+    const float beta1,
+    const float beta2,
+    const float eps
+);
+
+void launch_sh_colors_fused_fwd_kernel(
+    const uint32_t degrees_to_use,
+    const at::Tensor means,
+    const at::Tensor viewmats,
+    const at::Tensor sh0,
+    const at::Tensor coeffs,
+    at::Tensor colors
+);
+
 void launch_spherical_harmonics_l1_plus_bwd_kernel(
     // inputs
     const uint32_t degrees_to_use,
