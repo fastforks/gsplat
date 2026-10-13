@@ -1,7 +1,7 @@
 # gsplat: faster 3DGS training fork
 
 > **You are on `cuda-kernels`.** Research fork of [nerfstudio-project/gsplat](https://github.com/nerfstudio-project/gsplat) (base `512d366b`, 2026-09-19; `main` mirrors upstream). One branch: gsplat is a CUDA library, so there is no plain-PyTorch tier. Every change is opt-in through a `simple_trainer.py` flag; without the flags training runs the upstream code paths.
-> Licence, as upstream: Apache-2.0 ([LICENSE](LICENSE)). Changed files (Apache-2.0 §4(b)): `examples/simple_trainer.py`, `examples/datasets/colmap.py`, `examples/requirements.txt`, `gsplat/strategy/{default,ops}.py`, `gsplat/cuda/_wrapper.py`, `gsplat/cuda/ext.cpp`, and in `gsplat/cuda/csrc` / `include`: `Intersect.cpp`, `IntersectTile.cu`, `Rasterization.cpp`, `RasterizeToPixels3DGSSerialBatch{Fwd,Bwd}.cu`, `SphericalHarmonics{.cpp,.h,L1PlusCUDA.cu}`, `Utils.cuh`. New files: `gsplat/optimizers/{fused_sh_adam,geometry_adam}.py`, `gsplat/cuda/csrc/{GeometryAdamCUDA,StrategyCUDA}.cu`, `gsplat/cuda/include/AccuTile.cuh`, tests `tests/test_fused_training.py`. The commit history lists each change.
+> Licence, as upstream: Apache-2.0 ([LICENSE](LICENSE)).
 
 ```bash
 pip install -r examples/requirements.txt   # pins fastforks/fused-ssim (fused L1 + SSIM)
