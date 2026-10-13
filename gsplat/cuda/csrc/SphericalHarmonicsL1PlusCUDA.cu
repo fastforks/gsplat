@@ -1104,4 +1104,1030 @@ void launch_spherical_harmonics_l1_plus_bwd_kernels(
     }
     merge_streams();
 }
+// Backward of spherical_harmonics_l1_plus fused with the Adam update of shN.
+// Dense mode only (one coefficient row per gaussian). Each thread owns one
+// (gaussian, channel) column: it accumulates the shN gradient for that column in
+// registers over all images, then applies torch.optim.Adam's update (no weight
+// decay, no amsgrad) to the parameter and both moments in place, so the shN
+// gradient is never written to memory. Rows with zero gradient are still
+// updated, exactly as torch.optim.Adam does.
+// SH_C0 * sh0, as in spherical_harmonics_l0.
+constexpr float SH_L0_C0 = 0.2820947917738781f;
+// Max channels for the fused color path (per-thread scratch indexed by channel).
+constexpr uint32_t SH_FUSED_MAX_D = 4;
+
+// sqrt.approx.f32 (what sqrtf compiles to under --use_fast_math), as an
+// explicit instruction so its use does not depend on compiler flags.
+__device__ __forceinline__ float __fsqrt_rn_approx(const float x)
+{
+    float y;
+    asm("sqrt.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+// One Adam element update (torch.optim.Adam, wd=0). Every fused / lazy path uses
+// this single function so that replayed and eager updates are bitwise equal.
+__device__ __forceinline__ void adam_elem(
+    const float grad,
+    float &p,
+    float &m,
+    float &v,
+    const float beta1,
+    const float beta2,
+    const float eps,
+    const float step_size,
+    const float bias_correction2_sqrt
+)
+{
+    // Explicit intrinsics: the compiler may not contract or reorder them (unlike
+    // plain arithmetic under --use_fast_math), so every call site -- eager or
+    // replayed -- computes bit-identical results. sqrt / division use the fast
+    // hardware approximations (deterministic, ~1-2 ulp vs IEEE).
+    m               = __fmaf_rn(beta1, m, __fmul_rn(__fsub_rn(1.f, beta1), grad));
+    v               = __fmaf_rn(beta2, v, __fmul_rn(__fmul_rn(__fsub_rn(1.f, beta2), grad), grad));
+    const float den = __fadd_rn(__fdividef(__fsqrt_rn_approx(v), bias_correction2_sqrt), eps);
+    p               = __fsub_rn(p, __fdividef(__fmul_rn(step_size, m), den));
+}
+
+// COLORS = true: the forward was sh_colors_fused_fwd, i.e.
+//   colors = max(C0 * sh0 + l1plus(shN) + 0.5, 0)
+// so the color gradient is masked where the pre-activation is negative
+// (recomputed exactly), and sh0 also gets its gradient and Adam step here.
+template<int DEGREE, bool COLORS>
+__global__ void spherical_harmonics_l1_plus_bwd_adam_kernel(
+    const uint32_t BC,
+    const uint32_t N,
+    const uint32_t K,
+    const uint32_t D,
+    const uint32_t rows_per_block,
+    const float *__restrict__ means,
+    const float *__restrict__ viewmats,
+    float *__restrict__ coeffs,         // [N, K, D] updated in place
+    const float *__restrict__ v_colors, // [B*C, N, D]
+    float *__restrict__ exp_avg,        // [N, K, D]
+    float *__restrict__ exp_avg_sq,     // [N, K, D]
+    float *__restrict__ v_means,        // [N, 3] or nullptr
+    const float step_size,              // lr / bias_correction1
+    const float beta1,
+    const float beta2,
+    const float eps,
+    const float bias_correction2_sqrt,
+    // COLORS only: sh0 [N, 1, D] and its Adam state / hyper-parameters
+    float *__restrict__ sh0,
+    float *__restrict__ sh0_exp_avg,
+    float *__restrict__ sh0_exp_avg_sq,
+    const float sh0_step_size,
+    const float sh0_beta1,
+    const float sh0_beta2,
+    const float sh0_eps,
+    const float sh0_bias_correction2_sqrt
+)
+{
+    // Phase 1: one thread per (gaussian, channel) computes that column's shN
+    // gradient (as in spherical_harmonics_l1_plus_bwd_kernel) and stages it in
+    // shared memory. Phase 2: all threads sweep the block's contiguous
+    // [rows_per_block, K, D] slab with coalesced Adam updates.
+    extern __shared__ float grad_slab[]; // [rows_per_block * K * D]
+    const uint32_t tid      = threadIdx.x;
+    const int64_t row_begin = static_cast<int64_t>(blockIdx.x) * rows_per_block;
+    const uint32_t rows     = static_cast<uint32_t>(N - row_begin < rows_per_block ? N - row_begin : rows_per_block);
+    const uint32_t local    = tid / D;
+    const uint32_t c        = tid % D;
+    const int64_t coeff_id  = row_begin + local;
+
+    constexpr int MAX_K = (DEGREE + 1) * (DEGREE + 1) - 1;
+    float acc[MAX_K > 0 ? MAX_K : 1];
+#pragma unroll
+    for(int k = 0; k < (MAX_K > 0 ? MAX_K : 1); ++k)
+    {
+        acc[k] = 0.f;
+    }
+
+    float v_sh0 = 0.f; // COLORS only
+    if(local < rows)
+    {
+        if constexpr(DEGREE > 0 || COLORS)
+        {
+            const float *coeffs_ptr = coeffs + coeff_id * K * D;
+            for(uint32_t image_id = 0; image_id < BC; ++image_id)
+            {
+                const int64_t output_id = static_cast<int64_t>(image_id) * N + coeff_id;
+                vec3 v_dir              = {0.f, 0.f, 0.f};
+                float vc                = v_colors[output_id * D + c];
+                if(vc != 0.f)
+                {
+                    const vec3 dir = view_direction_from_camera_data(means + coeff_id * 3, viewmats, nullptr, image_id);
+                    if constexpr(COLORS)
+                    {
+                        // Recompute the pre-activation exactly as the forward did.
+                        // torch's clamp_min backward passes the gradient only where
+                        // x > 0 (zero at x == 0, which trained models hit often).
+                        float l1[SH_FUSED_MAX_D];
+                        l1[c] = 0.f;
+                        if constexpr(DEGREE > 0)
+                        {
+                            sh_l1_plus_coeffs_to_color_fast<float>(DEGREE, D, c, dir, coeffs_ptr, l1);
+                        }
+                        const float x = (sh0[coeff_id * D + c] * SH_L0_C0 + l1[c]) + 0.5f;
+                        if(!(x > 0.f))
+                        {
+                            vc = 0.f;
+                        }
+                        v_sh0 += vc * SH_L0_C0;
+                    }
+                    if constexpr(DEGREE > 0)
+                    {
+                        if(vc != 0.f)
+                        {
+                            float vloc[SH_FUSED_MAX_D];
+                            vloc[c] = vc;
+                            sh_l1_plus_coeffs_to_color_fast_vjp<float>(
+                                DEGREE, D, c, dir, coeffs_ptr, vloc, acc, v_means == nullptr ? nullptr : &v_dir
+                            );
+                        }
+                    }
+                }
+                if(v_means != nullptr && reduce_view_direction_channels(coeff_id, v_dir))
+                {
+                    float *v_mean = v_means + coeff_id * 3;
+                    gpuAtomicAdd(v_mean, v_dir.x);
+                    gpuAtomicAdd(v_mean + 1, v_dir.y);
+                    gpuAtomicAdd(v_mean + 2, v_dir.z);
+                }
+            }
+        }
+#pragma unroll
+        for(int k = 0; k < MAX_K; ++k)
+        {
+            if(static_cast<uint32_t>(k) < K)
+                grad_slab[local * K * D + k * D + c] = acc[k];
+        }
+        for(uint32_t k = MAX_K; k < K; ++k)
+        {
+            grad_slab[local * K * D + k * D + c] = 0.f;
+        }
+    }
+    __syncthreads();
+
+    // Adam, matching ATen's fused Adam (ADAM_MODE::ORIGINAL, weight_decay=0).
+    const uint32_t slab         = rows * K * D;
+    const int64_t base          = row_begin * K * D;
+    auto adam = [&](const float grad, float &p, float &m, float &v)
+    { adam_elem(grad, p, m, v, beta1, beta2, eps, step_size, bias_correction2_sqrt); };
+    // The launcher sizes blocks so that base and slab are multiples of 4 floats
+    // whenever K * D * rows_per_block allows it; use float4 then.
+    const bool vec4 = (base % 4 == 0) && (slab % 4 == 0);
+    if(vec4)
+    {
+        float4 *p4 = reinterpret_cast<float4 *>(coeffs + base);
+        float4 *m4 = reinterpret_cast<float4 *>(exp_avg + base);
+        float4 *v4 = reinterpret_cast<float4 *>(exp_avg_sq + base);
+        for(uint32_t e = tid; e < slab / 4; e += blockDim.x)
+        {
+            float4 p = p4[e], m = m4[e], v = v4[e];
+            adam(grad_slab[4 * e + 0], p.x, m.x, v.x);
+            adam(grad_slab[4 * e + 1], p.y, m.y, v.y);
+            adam(grad_slab[4 * e + 2], p.z, m.z, v.z);
+            adam(grad_slab[4 * e + 3], p.w, m.w, v.w);
+            p4[e] = p;
+            m4[e] = m;
+            v4[e] = v;
+        }
+    }
+    else
+    {
+        for(uint32_t e = tid; e < slab; e += blockDim.x)
+        {
+            const int64_t i = base + e;
+            float p = coeffs[i], m = exp_avg[i], v = exp_avg_sq[i];
+            adam(grad_slab[e], p, m, v);
+            coeffs[i]     = p;
+            exp_avg[i]    = m;
+            exp_avg_sq[i] = v;
+        }
+    }
+
+    if constexpr(COLORS)
+    {
+        // sh0 is [N, 1, D]: element (coeff_id, c) is owned by this thread and
+        // consecutive threads touch consecutive floats.
+        if(local < rows)
+        {
+            const int64_t i = coeff_id * D + c;
+            float p = sh0[i], m = sh0_exp_avg[i], v = sh0_exp_avg_sq[i];
+            adam_elem(v_sh0, p, m, v, sh0_beta1, sh0_beta2, sh0_eps, sh0_step_size, sh0_bias_correction2_sqrt);
+            sh0[i]            = p;
+            sh0_exp_avg[i]    = m;
+            sh0_exp_avg_sq[i] = v;
+        }
+    }
+}
+
+// colors = max(C0 * sh0 + l1plus(shN) + 0.5, 0), dense [BC, N, D]. Same
+// operation order as spherical_harmonics_l0 + spherical_harmonics_l1_plus
+// followed by (+ 0.5).clamp_min(0), so the result is bitwise identical.
+template<int DEGREE>
+__global__ void sh_colors_fused_fwd_kernel(
+    const uint32_t BC,
+    const uint32_t N,
+    const uint32_t K,
+    const uint32_t D,
+    const float *__restrict__ means,
+    const float *__restrict__ viewmats,
+    const float *__restrict__ sh0,    // [N, 1, D]
+    const float *__restrict__ coeffs, // [N, K, D]
+    float *__restrict__ colors        // [BC, N, D]
+)
+{
+    const int64_t idx = cg::this_grid().thread_rank();
+    if(idx >= static_cast<int64_t>(BC) * N * D)
+    {
+        return;
+    }
+    const uint32_t c        = static_cast<uint32_t>(idx % D);
+    const int64_t output_id = idx / D;
+    const uint32_t image_id = static_cast<uint32_t>(output_id / N);
+    const int64_t coeff_id  = output_id % N;
+    float l1[SH_FUSED_MAX_D];
+    l1[c] = 0.f;
+    if constexpr(DEGREE > 0)
+    {
+        const vec3 dir = view_direction_from_camera_data(means + coeff_id * 3, viewmats, nullptr, image_id);
+        sh_l1_plus_coeffs_to_color_fast<float>(DEGREE, D, c, dir, coeffs + coeff_id * K * D, l1);
+    }
+    const float x = (sh0[coeff_id * D + c] * SH_L0_C0 + l1[c]) + 0.5f;
+    colors[idx]   = x < 0.f ? 0.f : x;
+}
+
+void launch_sh_colors_fused_fwd_kernel(
+    const uint32_t degrees_to_use,
+    const at::Tensor means,
+    const at::Tensor viewmats,
+    const at::Tensor sh0,
+    const at::Tensor coeffs,
+    at::Tensor colors
+)
+{
+    const uint32_t D  = coeffs.size(-1);
+    const uint32_t K  = coeffs.size(-2);
+    const uint32_t N  = coeffs.size(0);
+    const uint32_t BC = viewmats.numel() / 16;
+    const int64_t n   = static_cast<int64_t>(BC) * N * D;
+    if(n == 0)
+    {
+        return;
+    }
+    constexpr unsigned int threads = 256;
+    const unsigned int blocks      = static_cast<unsigned int>(::cuda::ceil_div<int64_t>(n, threads));
+    auto stream                    = at::cuda::getCurrentCUDAStream();
+    const bool dispatched          = dispatch::dispatch(
+        dispatch::IntParam<0, 1, 2, 3>{static_cast<int>(degrees_to_use)},
+        [&]<typename DegConst>()
+        {
+            sh_colors_fused_fwd_kernel<DegConst::value><<<blocks, threads, 0, stream>>>(
+                BC,
+                N,
+                K,
+                D,
+                means.const_data_ptr<float>(),
+                viewmats.const_data_ptr<float>(),
+                sh0.const_data_ptr<float>(),
+                coeffs.const_data_ptr<float>(),
+                colors.data_ptr<float>()
+            );
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
+    );
+    TORCH_CHECK(dispatched, "Unsupported SH degree: ", degrees_to_use);
+}
+
+void launch_spherical_harmonics_l1_plus_bwd_adam_kernel(
+    const uint32_t degrees_to_use,
+    const at::Tensor means,      // [N, 3]
+    const at::Tensor viewmats,   // [B*C, 4, 4]
+    at::Tensor coeffs,           // [N, K, D]
+    const at::Tensor v_colors,   // [B*C, N, D]
+    at::Tensor exp_avg,
+    at::Tensor exp_avg_sq,
+    at::optional<at::Tensor> v_means,
+    const float step_size,
+    const float beta1,
+    const float beta2,
+    const float eps,
+    const float bias_correction2_sqrt,
+    at::optional<at::Tensor> sh0,
+    at::optional<at::Tensor> sh0_exp_avg,
+    at::optional<at::Tensor> sh0_exp_avg_sq,
+    const float sh0_step_size,
+    const float sh0_beta1,
+    const float sh0_beta2,
+    const float sh0_eps,
+    const float sh0_bias_correction2_sqrt
+)
+{
+    const uint32_t D  = coeffs.size(-1);
+    const uint32_t K  = coeffs.size(-2);
+    const uint32_t N  = coeffs.size(0);
+    const uint32_t BC = viewmats.numel() / 16;
+    const bool colors_mode = sh0.has_value();
+    TORCH_CHECK(!colors_mode || D <= SH_FUSED_MAX_D, "fused SH colors support up to ", SH_FUSED_MAX_D, " channels");
+    if(N == 0)
+    {
+        return;
+    }
+    TORCH_CHECK(D >= 1 && D <= SH_FUSED_MAX_D, "fused SH Adam supports 1..4 channels");
+    // Multiple of 4 rows keeps every block's slab 16-byte aligned for float4.
+    const uint32_t rows_per_block = 256 / D >= 4 ? (256 / D) / 4 * 4 : 256 / D;
+    const unsigned int threads    = rows_per_block * D;
+    const unsigned int blocks     = (N + rows_per_block - 1) / rows_per_block;
+    const size_t shmem            = static_cast<size_t>(rows_per_block) * K * D * sizeof(float);
+    auto stream                   = at::cuda::getCurrentCUDAStream();
+    const bool dispatched         = dispatch::dispatch(
+        dispatch::IntParam<0, 1, 2, 3>{static_cast<int>(degrees_to_use)},
+        [&]<typename DegConst>()
+        {
+            constexpr int DEGREE = DegConst::value;
+            auto kernel          = colors_mode ? spherical_harmonics_l1_plus_bwd_adam_kernel<DEGREE, true>
+                                               : spherical_harmonics_l1_plus_bwd_adam_kernel<DEGREE, false>;
+            if(shmem > 48 * 1024)
+            {
+                C10_CUDA_CHECK(
+                    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shmem))
+                );
+            }
+            kernel<<<blocks, threads, shmem, stream>>>(
+                BC,
+                N,
+                K,
+                D,
+                rows_per_block,
+                means.const_data_ptr<float>(),
+                viewmats.const_data_ptr<float>(),
+                coeffs.data_ptr<float>(),
+                v_colors.const_data_ptr<float>(),
+                exp_avg.data_ptr<float>(),
+                exp_avg_sq.data_ptr<float>(),
+                v_means.has_value() ? v_means.value().data_ptr<float>() : nullptr,
+                step_size,
+                beta1,
+                beta2,
+                eps,
+                bias_correction2_sqrt,
+                colors_mode ? sh0.value().data_ptr<float>() : nullptr,
+                colors_mode ? sh0_exp_avg.value().data_ptr<float>() : nullptr,
+                colors_mode ? sh0_exp_avg_sq.value().data_ptr<float>() : nullptr,
+                sh0_step_size,
+                sh0_beta1,
+                sh0_beta2,
+                sh0_eps,
+                sh0_bias_correction2_sqrt
+            );
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
+    );
+    TORCH_CHECK(dispatched, "Unsupported SH degree: ", degrees_to_use);
+}
+// ---------------------------------------------------------------------------
+// Lazy (deferred) Adam for sh0 / shN.
+//
+// A zero-gradient Adam step is a deterministic function of (p, m, v) and that
+// step's constants, and SH coefficients never influence which gaussians are
+// visible. So a row whose color gradient is zero this step can skip its Adam
+// update entirely; the missed steps are replayed later with exactly the same
+// float operations (bitwise identical to having applied them eagerly):
+//   - in the forward, in registers, for rows that are visible this step,
+//   - in the backward, for rows that receive a gradient, before their update,
+//   - for all rows in sh_lazy_catchup (before densification / eval / save).
+// last[row] is the last optimizer step applied to the row (both sh0 and shN).
+// Per-step constants live in tables indexed by step: tabs[0][t] = sh0
+// step_size, tabs[1][t] = sh0 bias_correction2_sqrt, tabs[2]/[3] for shN.
+// ---------------------------------------------------------------------------
+
+struct LazyAdamConsts
+{
+    const float *step_size; // [T] indexed by step
+    const float *bc2_sqrt;  // [T]
+    float beta1, beta2, eps;
+};
+
+__device__ __forceinline__ void
+lazy_adam_update(const float grad, float &p, float &m, float &v, const LazyAdamConsts &c, const int step)
+{
+    adam_elem(grad, p, m, v, c.beta1, c.beta2, c.eps, c.step_size[step], c.bc2_sqrt[step]);
+}
+
+// Apply zero-gradient steps (from, to] in place. `zero` is a runtime 0.f so the
+// arithmetic is identical to an eager step with a zero gradient.
+__device__ __forceinline__ void lazy_adam_replay(
+    float &p, float &m, float &v, const LazyAdamConsts &c, const int from, const int to, const float zero
+)
+{
+    for(int s = from + 1; s <= to; ++s)
+    {
+        lazy_adam_update(zero, p, m, v, c, s);
+    }
+}
+
+// Replay only the moments (they do not depend on p): bitwise equal to the m, v
+// produced by lazy_adam_replay.
+__device__ __forceinline__ void
+lazy_adam_replay_mv(float &m, float &v, const LazyAdamConsts &c, const int from, const int to, const float zero)
+{
+    float p = 0.f;
+    for(int s = from + 1; s <= to; ++s)
+    {
+        lazy_adam_update(zero, p, m, v, c, s);
+    }
+}
+
+// Both lazy kernels: a block owns rows_per_block consecutive rows (D threads
+// per row in the per-row phases). Rows' shN slabs are read with coalesced
+// sweeps, caught up, and staged in shared memory for the per-row math.
+
+template<int DEGREE>
+__global__ void sh_colors_lazy_fwd_kernel(
+    const uint32_t BC,
+    const uint32_t N,
+    const uint32_t K,
+    const uint32_t D,
+    const uint32_t rows_per_block,
+    const float *__restrict__ means,
+    const float *__restrict__ viewmats,
+    const bool *__restrict__ mask, // [BC, N] rows needed this step (superset of visible)
+    const float *__restrict__ sh0,
+    const float *__restrict__ sh0_m,
+    const float *__restrict__ sh0_v,
+    const float *__restrict__ shN,
+    const float *__restrict__ shN_m,
+    const float *__restrict__ shN_v,
+    const int32_t *__restrict__ last,
+    const int step, // the step being taken; parameters are current as of step - 1
+    const LazyAdamConsts c0,
+    const LazyAdamConsts cN,
+    const float zero,
+    float *__restrict__ colors // [BC, N, D]
+)
+{
+    extern __shared__ float lazy_fwd_smem[];
+    float *p_slab = lazy_fwd_smem;                                             // [rows_per_block * K * D]
+    int *needed   = reinterpret_cast<int *>(p_slab + rows_per_block * K * D);  // [rows_per_block]
+    int *row_from = needed + rows_per_block;                                   // [rows_per_block]
+
+    const uint32_t tid      = threadIdx.x;
+    const int64_t row_begin = static_cast<int64_t>(blockIdx.x) * rows_per_block;
+    const uint32_t rows     = static_cast<uint32_t>(N - row_begin < rows_per_block ? N - row_begin : rows_per_block);
+    const uint32_t local    = tid / D;
+    const uint32_t c        = tid % D;
+    const int64_t row       = row_begin + local;
+    const int to            = step - 1;
+
+    if(tid < rows)
+    {
+        bool any = false;
+        for(uint32_t image_id = 0; image_id < BC; ++image_id)
+        {
+            any |= mask[static_cast<int64_t>(image_id) * N + row_begin + tid];
+        }
+        needed[tid]   = any;
+        row_from[tid] = last[row_begin + tid];
+    }
+    __syncthreads();
+
+    if constexpr(DEGREE > 0)
+    {
+        const uint32_t KD   = K * D;
+        const uint32_t slab = rows * KD;
+        const int64_t base  = row_begin * KD;
+        for(uint32_t e = tid; e < slab; e += blockDim.x)
+        {
+            const uint32_t lr = e / KD;
+            if(!needed[lr])
+            {
+                continue;
+            }
+            const int64_t i = base + e;
+            float p         = shN[i];
+            if(row_from[lr] < to)
+            {
+                float m = shN_m[i], v = shN_v[i];
+                lazy_adam_replay(p, m, v, cN, row_from[lr], to, zero);
+            }
+            p_slab[e] = p;
+        }
+        __syncthreads();
+    }
+
+    if(local >= rows)
+    {
+        return;
+    }
+    float s0 = 0.f;
+    if(needed[local])
+    {
+        s0 = sh0[row * D + c];
+        if(row_from[local] < to)
+        {
+            float m = sh0_m[row * D + c], v = sh0_v[row * D + c];
+            lazy_adam_replay(s0, m, v, c0, row_from[local], to, zero);
+        }
+    }
+    for(uint32_t image_id = 0; image_id < BC; ++image_id)
+    {
+        const int64_t output_id = static_cast<int64_t>(image_id) * N + row;
+        if(!mask[output_id])
+        {
+            colors[output_id * D + c] = 0.f; // never rasterized
+            continue;
+        }
+        float l1[SH_FUSED_MAX_D];
+        l1[c] = 0.f;
+        if constexpr(DEGREE > 0)
+        {
+            const vec3 dir = view_direction_from_camera_data(means + row * 3, viewmats, nullptr, image_id);
+            sh_l1_plus_coeffs_to_color_fast<float>(DEGREE, D, c, dir, p_slab + local * K * D, l1);
+        }
+        const float x             = (s0 * SH_L0_C0 + l1[c]) + 0.5f;
+        colors[output_id * D + c] = x < 0.f ? 0.f : x;
+    }
+}
+
+template<int DEGREE>
+__global__ void sh_colors_lazy_bwd_adam_kernel(
+    const uint32_t BC,
+    const uint32_t N,
+    const uint32_t K,
+    const uint32_t D,
+    const uint32_t rows_per_block,
+    const float *__restrict__ means,
+    const float *__restrict__ viewmats,
+    const float *__restrict__ v_colors, // [BC, N, D]
+    float *__restrict__ sh0,
+    float *__restrict__ sh0_m,
+    float *__restrict__ sh0_v,
+    float *__restrict__ shN,
+    float *__restrict__ shN_m,
+    float *__restrict__ shN_v,
+    int32_t *__restrict__ last,
+    const int step,
+    const LazyAdamConsts c0,
+    const LazyAdamConsts cN,
+    const float zero,
+    float *__restrict__ v_means // [N, 3] or nullptr
+)
+{
+    extern __shared__ float lazy_smem[];
+    const uint32_t KD = K * D;
+    float *p_slab     = lazy_smem;                                                 // caught-up shN, by active slot
+    float *grad_slab  = p_slab + rows_per_block * KD;                              // shN gradient, by active slot
+    int *active       = reinterpret_cast<int *>(grad_slab + rows_per_block * KD); // [rows_per_block] flags
+    int *active_list  = active + rows_per_block;                                   // [rows_per_block] local rows
+    int *row_from     = active_list + rows_per_block;                              // [rows_per_block] by slot
+    int *n_active_sm  = row_from + rows_per_block;                                 // [1 + warps] counters
+
+    const uint32_t tid      = threadIdx.x;
+    // Row sweeps use whole warps only (lanes stride along a row); blockDim.x
+    // need not be a multiple of 32.
+    const uint32_t lane = tid % 32, warp_id = tid / 32;
+    const int64_t row_begin = static_cast<int64_t>(blockIdx.x) * rows_per_block;
+    const uint32_t rows     = static_cast<uint32_t>(N - row_begin < rows_per_block ? N - row_begin : rows_per_block);
+    const int to            = step - 1;
+
+    if(tid < rows_per_block)
+    {
+        active[tid] = 0;
+    }
+    __syncthreads();
+    // A row is updated this step iff any of its color gradients is nonzero;
+    // otherwise its (zero-gradient) update is deferred. Coalesced over the
+    // block's [rows, D] gradient slab.
+    for(uint32_t e = tid; e < rows * D; e += blockDim.x)
+    {
+        bool any = false;
+        for(uint32_t image_id = 0; image_id < BC; ++image_id)
+        {
+            any |= v_colors[(static_cast<int64_t>(image_id) * N + row_begin) * D + e] != 0.f;
+        }
+        if(any)
+        {
+            active[e / D] = 1;
+        }
+    }
+    __syncthreads();
+    // Compact the active rows of this block (order preserved).
+    if(warp_id == 0)
+    {
+        int count = 0;
+        for(uint32_t base_row = 0; base_row < rows; base_row += 32)
+        {
+            const uint32_t r   = base_row + lane;
+            const bool f       = r < rows && active[r];
+            const unsigned bal = __ballot_sync(0xffffffffu, f);
+            if(f)
+            {
+                const int slot     = count + __popc(bal & ((1u << lane) - 1u));
+                active_list[slot]  = static_cast<int>(r);
+                row_from[slot]     = last[row_begin + r];
+            }
+            count += __popc(bal);
+        }
+        if(lane == 0)
+        {
+            n_active_sm[0] = count;
+        }
+    }
+    __syncthreads();
+    const int n_active = n_active_sm[0];
+    if(n_active == 0)
+    {
+        return;
+    }
+
+    // Stage caught-up shN of the active rows. Flat sweep over the compacted
+    // [n_active, KD] slab: element e = tid + u * blockDim.x, all loads of a
+    // thread issued before any replay. The caught-up moments of the first
+    // LAZY_REG_U elements per thread stay in registers for the final update
+    // (same thread, same elements); the rest are re-read and replayed there.
+    const uint32_t total = static_cast<uint32_t>(n_active) * KD;
+    constexpr int LAZY_REG_U = 8;
+    float m_reg[LAZY_REG_U], v_reg[LAZY_REG_U];
+    {
+        float p_reg[LAZY_REG_U];
+        int from_reg[LAZY_REG_U];
+#pragma unroll
+        for(int u = 0; u < LAZY_REG_U; ++u)
+        {
+            const uint32_t e = tid + u * blockDim.x;
+            if(e < total)
+            {
+                const uint32_t a = e / KD;
+                const int64_t gi = (row_begin + active_list[a]) * KD + (e - a * KD);
+                from_reg[u]      = row_from[a];
+                p_reg[u]         = shN[gi];
+                m_reg[u]         = shN_m[gi];
+                v_reg[u]         = shN_v[gi];
+            }
+        }
+#pragma unroll
+        for(int u = 0; u < LAZY_REG_U; ++u)
+        {
+            const uint32_t e = tid + u * blockDim.x;
+            if(e < total)
+            {
+                lazy_adam_replay(p_reg[u], m_reg[u], v_reg[u], cN, from_reg[u], to, zero);
+                p_slab[e] = p_reg[u];
+            }
+        }
+        for(uint32_t e = tid + LAZY_REG_U * blockDim.x; e < total; e += blockDim.x)
+        {
+            const uint32_t a = e / KD;
+            const int64_t gi = (row_begin + active_list[a]) * KD + (e - a * KD);
+            const int from   = row_from[a];
+            float p          = shN[gi];
+            if(from < to)
+            {
+                float m = shN_m[gi], v = shN_v[gi];
+                lazy_adam_replay(p, m, v, cN, from, to, zero);
+            }
+            p_slab[e] = p;
+        }
+    }
+    __syncthreads();
+
+    // Per (active row, channel) gradient math on contiguous threads.
+    if(tid < static_cast<uint32_t>(n_active) * D)
+    {
+        const int a          = tid / D;
+        const uint32_t c     = tid % D;
+        const int64_t row    = row_begin + active_list[a];
+        const int from       = row_from[a];
+        constexpr int MAX_K  = (DEGREE + 1) * (DEGREE + 1) - 1;
+        float acc[MAX_K > 0 ? MAX_K : 1];
+#pragma unroll
+        for(int k = 0; k < (MAX_K > 0 ? MAX_K : 1); ++k)
+        {
+            acc[k] = 0.f;
+        }
+        float s0 = sh0[row * D + c], s0_m = sh0_m[row * D + c], s0_v = sh0_v[row * D + c];
+        lazy_adam_replay(s0, s0_m, s0_v, c0, from, to, zero);
+        const float *ce = p_slab + a * KD;
+        float v_sh0     = 0.f;
+        for(uint32_t image_id = 0; image_id < BC; ++image_id)
+        {
+            const int64_t output_id = static_cast<int64_t>(image_id) * N + row;
+            vec3 v_dir              = {0.f, 0.f, 0.f};
+            float vc                = v_colors[output_id * D + c];
+            if(vc != 0.f)
+            {
+                const vec3 dir = view_direction_from_camera_data(means + row * 3, viewmats, nullptr, image_id);
+                float l1[SH_FUSED_MAX_D];
+                l1[c] = 0.f;
+                if constexpr(DEGREE > 0)
+                {
+                    sh_l1_plus_coeffs_to_color_fast<float>(DEGREE, D, c, dir, ce, l1);
+                }
+                const float x = (s0 * SH_L0_C0 + l1[c]) + 0.5f;
+                if(!(x > 0.f)) // torch clamp_min backward
+                {
+                    vc = 0.f;
+                }
+                v_sh0 += vc * SH_L0_C0;
+                if constexpr(DEGREE > 0)
+                {
+                    if(vc != 0.f)
+                    {
+                        float vloc[SH_FUSED_MAX_D];
+                        vloc[c] = vc;
+                        sh_l1_plus_coeffs_to_color_fast_vjp<float>(
+                            DEGREE, D, c, dir, ce, vloc, acc, v_means == nullptr ? nullptr : &v_dir
+                        );
+                    }
+                }
+            }
+            if(v_means != nullptr && reduce_view_direction_channels(row, v_dir))
+            {
+                float *v_mean = v_means + row * 3;
+                gpuAtomicAdd(v_mean, v_dir.x);
+                gpuAtomicAdd(v_mean + 1, v_dir.y);
+                gpuAtomicAdd(v_mean + 2, v_dir.z);
+            }
+        }
+#pragma unroll
+        for(int k = 0; k < MAX_K; ++k)
+        {
+            if(static_cast<uint32_t>(k) < K)
+                grad_slab[a * KD + k * D + c] = acc[k];
+        }
+        for(uint32_t k = MAX_K; k < K; ++k)
+        {
+            grad_slab[a * KD + k * D + c] = 0.f;
+        }
+        lazy_adam_update(v_sh0, s0, s0_m, s0_v, c0, step);
+        sh0[row * D + c]   = s0;
+        sh0_m[row * D + c] = s0_m;
+        sh0_v[row * D + c] = s0_v;
+    }
+    __syncthreads();
+
+    // shN update of the active rows, same flat element mapping as the staging
+    // sweep: p comes caught-up from shared memory, the moments from registers
+    // (or re-read and replayed beyond the register-cached elements).
+#pragma unroll
+    for(int u = 0; u < LAZY_REG_U; ++u)
+    {
+        const uint32_t e = tid + u * blockDim.x;
+        if(e < total)
+        {
+            const uint32_t a = e / KD;
+            const int64_t gi = (row_begin + active_list[a]) * KD + (e - a * KD);
+            float p = p_slab[e], m = m_reg[u], v = v_reg[u];
+            lazy_adam_update(grad_slab[e], p, m, v, cN, step);
+            shN[gi]   = p;
+            shN_m[gi] = m;
+            shN_v[gi] = v;
+        }
+    }
+    for(uint32_t e = tid + LAZY_REG_U * blockDim.x; e < total; e += blockDim.x)
+    {
+        const uint32_t a = e / KD;
+        const int64_t gi = (row_begin + active_list[a]) * KD + (e - a * KD);
+        float p = p_slab[e], m = shN_m[gi], v = shN_v[gi];
+        lazy_adam_replay_mv(m, v, cN, row_from[a], to, zero);
+        lazy_adam_update(grad_slab[e], p, m, v, cN, step);
+        shN[gi]   = p;
+        shN_m[gi] = m;
+        shN_v[gi] = v;
+    }
+    if(tid < static_cast<uint32_t>(n_active))
+    {
+        last[row_begin + active_list[tid]] = step;
+    }
+}
+
+// Replay all deferred steps up to and including `step` for every row.
+__global__ void sh_lazy_catchup_kernel(
+    const int64_t n_elems, // N * KD
+    const uint32_t KD,
+    float *__restrict__ p,
+    float *__restrict__ m,
+    float *__restrict__ v,
+    const int32_t *__restrict__ last,
+    const int step,
+    const LazyAdamConsts consts,
+    const float zero
+)
+{
+    const int64_t i = cg::this_grid().thread_rank();
+    if(i >= n_elems)
+    {
+        return;
+    }
+    const int from = last[i / KD];
+    if(from >= step)
+    {
+        return;
+    }
+    float pp = p[i], mm = m[i], vv = v[i];
+    lazy_adam_replay(pp, mm, vv, consts, from, step, zero);
+    p[i] = pp;
+    m[i] = mm;
+    v[i] = vv;
+}
+
+void launch_sh_colors_lazy_fwd_kernel(
+    const uint32_t degrees_to_use,
+    const at::Tensor means,
+    const at::Tensor viewmats,
+    const at::Tensor mask,
+    const at::Tensor sh0,
+    const at::Tensor sh0_m,
+    const at::Tensor sh0_v,
+    const at::Tensor shN,
+    const at::Tensor shN_m,
+    const at::Tensor shN_v,
+    const at::Tensor last,
+    const int step,
+    const at::Tensor tabs,
+    const float sh0_beta1,
+    const float sh0_beta2,
+    const float sh0_eps,
+    const float shN_beta1,
+    const float shN_beta2,
+    const float shN_eps,
+    at::Tensor colors
+)
+{
+    const uint32_t D  = shN.size(-1);
+    const uint32_t K  = shN.size(-2);
+    const uint32_t N  = shN.size(0);
+    const uint32_t BC = viewmats.numel() / 16;
+    const int64_t n   = static_cast<int64_t>(BC) * N * D;
+    if(n == 0)
+    {
+        return;
+    }
+    const float *t                = tabs.const_data_ptr<float>();
+    const int64_t T               = tabs.size(1);
+    const LazyAdamConsts c0       = {t, t + T, sh0_beta1, sh0_beta2, sh0_eps};
+    const LazyAdamConsts cN       = {t + 2 * T, t + 3 * T, shN_beta1, shN_beta2, shN_eps};
+    const uint32_t rows_per_block = 256 / D >= 4 ? (256 / D) / 4 * 4 : 256 / D;
+    const unsigned int threads    = rows_per_block * D;
+    const unsigned int blocks     = (N + rows_per_block - 1) / rows_per_block;
+    const size_t shmem = static_cast<size_t>(rows_per_block) * K * D * sizeof(float) + 2 * rows_per_block * sizeof(int);
+    auto stream        = at::cuda::getCurrentCUDAStream();
+    const bool dispatched = dispatch::dispatch(
+        dispatch::IntParam<0, 1, 2, 3>{static_cast<int>(degrees_to_use)},
+        [&]<typename DegConst>()
+        {
+            auto kernel = sh_colors_lazy_fwd_kernel<DegConst::value>;
+            if(shmem > 48 * 1024)
+            {
+                C10_CUDA_CHECK(
+                    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shmem))
+                );
+            }
+            kernel<<<blocks, threads, shmem, stream>>>(
+                BC,
+                N,
+                K,
+                D,
+                rows_per_block,
+                means.const_data_ptr<float>(),
+                viewmats.const_data_ptr<float>(),
+                mask.const_data_ptr<bool>(),
+                sh0.const_data_ptr<float>(),
+                sh0_m.const_data_ptr<float>(),
+                sh0_v.const_data_ptr<float>(),
+                shN.const_data_ptr<float>(),
+                shN_m.const_data_ptr<float>(),
+                shN_v.const_data_ptr<float>(),
+                last.const_data_ptr<int32_t>(),
+                step,
+                c0,
+                cN,
+                0.f,
+                colors.data_ptr<float>()
+            );
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
+    );
+    TORCH_CHECK(dispatched, "Unsupported SH degree: ", degrees_to_use);
+}
+
+void launch_sh_colors_lazy_bwd_adam_kernel(
+    const uint32_t degrees_to_use,
+    const at::Tensor means,
+    const at::Tensor viewmats,
+    const at::Tensor v_colors,
+    at::Tensor sh0,
+    at::Tensor sh0_m,
+    at::Tensor sh0_v,
+    at::Tensor shN,
+    at::Tensor shN_m,
+    at::Tensor shN_v,
+    at::Tensor last,
+    const int step,
+    const at::Tensor tabs,
+    const float sh0_beta1,
+    const float sh0_beta2,
+    const float sh0_eps,
+    const float shN_beta1,
+    const float shN_beta2,
+    const float shN_eps,
+    at::optional<at::Tensor> v_means
+)
+{
+    const uint32_t D  = shN.size(-1);
+    const uint32_t K  = shN.size(-2);
+    const uint32_t N  = shN.size(0);
+    const uint32_t BC = viewmats.numel() / 16;
+    if(N == 0)
+    {
+        return;
+    }
+    const float *t                = tabs.const_data_ptr<float>();
+    const int64_t T               = tabs.size(1);
+    const LazyAdamConsts c0       = {t, t + T, sh0_beta1, sh0_beta2, sh0_eps};
+    const LazyAdamConsts cN       = {t + 2 * T, t + 3 * T, shN_beta1, shN_beta2, shN_eps};
+    // ~128-thread blocks: smaller shared-memory footprint, more resident blocks
+    // per SM to overlap the phases.
+    const uint32_t rows_per_block = (128 / D) / 4 * 4; // D <= SH_FUSED_MAX_D (checked)
+    const unsigned int threads    = rows_per_block * D;
+    const unsigned int blocks     = (N + rows_per_block - 1) / rows_per_block;
+    const size_t shmem = 2 * static_cast<size_t>(rows_per_block) * K * D * sizeof(float)
+                       + (3 * rows_per_block + 1 + 32) * sizeof(int);
+    auto stream        = at::cuda::getCurrentCUDAStream();
+    const bool dispatched = dispatch::dispatch(
+        dispatch::IntParam<0, 1, 2, 3>{static_cast<int>(degrees_to_use)},
+        [&]<typename DegConst>()
+        {
+            auto kernel = sh_colors_lazy_bwd_adam_kernel<DegConst::value>;
+            if(shmem > 48 * 1024)
+            {
+                C10_CUDA_CHECK(
+                    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shmem))
+                );
+            }
+            kernel<<<blocks, threads, shmem, stream>>>(
+                BC,
+                N,
+                K,
+                D,
+                rows_per_block,
+                means.const_data_ptr<float>(),
+                viewmats.const_data_ptr<float>(),
+                v_colors.const_data_ptr<float>(),
+                sh0.data_ptr<float>(),
+                sh0_m.data_ptr<float>(),
+                sh0_v.data_ptr<float>(),
+                shN.data_ptr<float>(),
+                shN_m.data_ptr<float>(),
+                shN_v.data_ptr<float>(),
+                last.data_ptr<int32_t>(),
+                step,
+                c0,
+                cN,
+                0.f,
+                v_means.has_value() ? v_means.value().data_ptr<float>() : nullptr
+            );
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
+    );
+    TORCH_CHECK(dispatched, "Unsupported SH degree: ", degrees_to_use);
+}
+
+void launch_sh_lazy_catchup_kernel(
+    at::Tensor p,
+    at::Tensor m,
+    at::Tensor v,
+    const at::Tensor last,
+    const int step,
+    const at::Tensor step_size_tab,
+    const at::Tensor bc2_sqrt_tab,
+    const float beta1,
+    const float beta2,
+    const float eps
+)
+{
+    const int64_t n = p.numel();
+    if(n == 0)
+    {
+        return;
+    }
+    const uint32_t KD             = static_cast<uint32_t>(n / p.size(0));
+    const LazyAdamConsts consts   = {step_size_tab.const_data_ptr<float>(), bc2_sqrt_tab.const_data_ptr<float>(), beta1, beta2, eps};
+    constexpr unsigned int threads = 256;
+    const unsigned int blocks      = static_cast<unsigned int>(::cuda::ceil_div<int64_t>(n, threads));
+    sh_lazy_catchup_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        n,
+        KD,
+        p.data_ptr<float>(),
+        m.data_ptr<float>(),
+        v.data_ptr<float>(),
+        last.const_data_ptr<int32_t>(),
+        step,
+        consts,
+        0.f
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 } // namespace gsplat
