@@ -204,9 +204,19 @@ class Config:
     # With fused_geometry_adam + lazy_sh_adam: the projection backward runs in
     # the same kernel as the geometry Adam step (gradients stay in registers).
     fused_projection_adam: bool = False
-
     # Compute the L1 and SSIM losses in one fused-ssim pass (same gradients).
     fused_l1_ssim: bool = False
+    # With lazy_sh_adam: keep the sh0/shN Adam moments in bfloat16 with
+    # stochastic rounding (approximate; halves their memory traffic and size).
+    sh_adam_bf16: bool = False
+    # With fused_projection_adam: update DefaultStrategy's grad2d / count stats
+    # inside the fused projection backward (bitwise equal; one pass less).
+    fused_strategy_stats: bool = False
+    # With fused_geometry_adam: keep the means/quats/scales/opacities Adam moments
+    # in bfloat16 with stochastic rounding (approximate).
+    geo_adam_bf16: bool = False
+    # PyTorch CUDA allocator with expandable segments (less reserved memory).
+    expandable_segments: bool = False
     # Turn on another SH degree every this steps
     sh_degree_interval: int = 1000
     # Initial opacity of GS
@@ -477,6 +487,10 @@ class Runner:
             assert not cfg.visible_adam and not cfg.sparse_grad and not cfg.app_opt
         if cfg.fused_projection_adam:
             assert cfg.fused_geometry_adam and cfg.lazy_sh_adam and not cfg.antialiased
+        if cfg.fused_strategy_stats:
+            assert cfg.fused_projection_adam and isinstance(cfg.strategy, DefaultStrategy)
+            assert not cfg.strategy.absgrad and cfg.strategy.refine_scale2d_stop_iter == 0
+            assert cfg.strategy.key_for_gradient == "means2d" and cfg.batch_size == 1
         if cfg.lazy_sh_adam:
             assert not cfg.packed and cfg.camera_model == "pinhole" and not cfg.with_ut and not cfg.with_eval3d
             assert isinstance(cfg.strategy, DefaultStrategy), "lazy_sh_adam supports DefaultStrategy"
@@ -603,11 +617,18 @@ class Runner:
         )
         self.scene = GaussianScene.from_splats(self.splats, id="scene")
         self.lazy_sh = (
-            LazySHAdam(self.optimizers["sh0"], self.optimizers["shN"])
+            LazySHAdam(
+                self.optimizers["sh0"], self.optimizers["shN"],
+                state_dtype=torch.bfloat16 if cfg.sh_adam_bf16 else torch.float32,
+            )
             if cfg.lazy_sh_adam
             else None
         )
-        self.geo_adam = GeometryAdam(self.optimizers) if cfg.fused_geometry_adam else None
+        self.geo_adam = (
+            GeometryAdam(self.optimizers, state_dtype=torch.bfloat16 if cfg.geo_adam_bf16 else torch.float32)
+            if cfg.fused_geometry_adam
+            else None
+        )
         if self.lazy_sh is not None and self.geo_adam is not None:
             self.lazy_sh.means_grad_sink = self.geo_adam
         self.splats = self.scene.splats
@@ -779,6 +800,16 @@ class Runner:
                 means, None, quats, scales, viewmats, Ks, width, height,
                 eps2d=0.3, near_plane=near_plane, far_plane=far_plane, opacities=opacities,
             )
+        stats_fused = False
+        if raw_geometry and getattr(self, "_fuse_stats_step", False):
+            self._fuse_stats_step = False
+            st = self.strategy_state
+            if st["grad2d"] is None:
+                st["grad2d"] = torch.zeros(N, device=means.device)
+            if st["count"] is None:
+                st["count"] = torch.zeros(N, device=means.device)
+            self.geo_adam.strategy_stats = (st["grad2d"], st["count"], width / 2.0 * C, height / 2.0 * C)
+            stats_fused = True
         mask = radii[..., 0] > 0  # culled gaussians have radii (0, 0), visible ones >= 1
         colors = self.lazy_sh.colors(sh_degree, means, viewmats, mask)  # [C, N, 3]
         # With one camera a plain view: expand's backward would copy the gradient.
@@ -1155,6 +1186,8 @@ class Runner:
 
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
+            # DefaultStrategy only accumulates its stats before refine_stop_iter.
+            self._fuse_stats_step = cfg.fused_strategy_stats and step < cfg.strategy.refine_stop_iter
 
             # forward
             renders, alphas, info = self.stage.render(
@@ -1806,6 +1839,12 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         cfg.disable_viewer = True
         if world_rank == 0:
             print("Viewer is disabled in distributed training.")
+
+    if cfg.expandable_segments:
+        # Before the first CUDA allocation. Densification grows every per-gaussian
+        # tensor each refine step; expandable segments avoid the fragmentation
+        # that otherwise inflates reserved memory.
+        torch.cuda.memory._set_allocator_settings("expandable_segments:True")
 
     runner = Runner(local_rank, world_rank, world_size, cfg)
 
