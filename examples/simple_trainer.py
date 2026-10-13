@@ -59,7 +59,13 @@ from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization, RasterizeMode
-from gsplat.cuda._wrapper import fully_fused_projection
+from gsplat.cuda._wrapper import (
+    fully_fused_projection,
+    isect_offset_encode,
+    isect_tiles,
+    rasterize_to_pixels,
+)
+from gsplat.optimizers.geometry_adam import GeometryAdam
 from gsplat.optimizers.fused_sh_adam import (
     LazySHAdam,
     sh_colors_fused_adam,
@@ -188,6 +194,12 @@ class Config:
     # gradient skip their Adam step; the deferred zero-gradient steps are replayed
     # bit-exactly when the row is next needed (see gsplat.optimizers.LazySHAdam).
     lazy_sh_adam: bool = False
+    # Apply the Adam steps of means/quats/scales/opacities (with the exp/sigmoid
+    # activation backward) in one fused kernel inside the backward pass.
+    fused_geometry_adam: bool = False
+    # With fused_geometry_adam + lazy_sh_adam: the projection backward runs in
+    # the same kernel as the geometry Adam step (gradients stay in registers).
+    fused_projection_adam: bool = False
     # Turn on another SH degree every this steps
     sh_degree_interval: int = 1000
     # Initial opacity of GS
@@ -447,14 +459,22 @@ class Runner:
         set_random_seed(42 + local_rank)
 
         self.cfg = cfg
-        if cfg.fused_shn_adam or cfg.fused_sh_colors or cfg.lazy_sh_adam:
+        if cfg.fused_shn_adam or cfg.fused_sh_colors or cfg.lazy_sh_adam or cfg.fused_geometry_adam:
             if world_size != 1:
                 raise ValueError("fused training optimizers support single-process training only")
+        if cfg.fused_shn_adam or cfg.fused_sh_colors or cfg.lazy_sh_adam:
             if cfg.pose_opt:
                 raise ValueError("fused SH optimizers do not support pose optimization")
+        if cfg.fused_geometry_adam:
+            assert cfg.opacity_reg == 0 and cfg.scale_reg == 0, "regularizers would bypass the fused step"
+            assert not cfg.visible_adam and not cfg.sparse_grad and not cfg.app_opt
+        if cfg.fused_projection_adam:
+            assert cfg.fused_geometry_adam and cfg.lazy_sh_adam and not cfg.antialiased
         if cfg.lazy_sh_adam:
             assert not cfg.packed and cfg.camera_model == "pinhole" and not cfg.with_ut and not cfg.with_eval3d
             assert isinstance(cfg.strategy, DefaultStrategy), "lazy_sh_adam supports DefaultStrategy"
+            cfg.strategy.grad_hook = True  # no retain_grad copy of the 2D-means gradient
+            cfg.strategy.fused_state_update = True  # one fused op for grad2d / count
         if cfg.fused_shn_adam or cfg.fused_sh_colors or cfg.lazy_sh_adam:
             assert cfg.split_sh and not cfg.sh_fp16 and not cfg.app_opt, "fused_shn_adam requires split_sh"
             assert not cfg.visible_adam and not cfg.sparse_grad, "fused_shn_adam requires torch Adam"
@@ -578,6 +598,9 @@ class Runner:
             if cfg.lazy_sh_adam
             else None
         )
+        self.geo_adam = GeometryAdam(self.optimizers) if cfg.fused_geometry_adam else None
+        if self.lazy_sh is not None and self.geo_adam is not None:
+            self.lazy_sh.means_grad_sink = self.geo_adam
         self.splats = self.scene.splats
         self.stage = Stage()
         self.stage.add_scene(self.scene, self.rasterize_splats)
@@ -725,6 +748,66 @@ class Runner:
         self._gaussians_frozen = True
         print("[Distillation] Gaussian parameters frozen")
 
+    def _render_lowlevel_lazy(
+        self, means, quats, scales, opacities, viewmats, Ks, width, height, sh_degree, near_plane, far_plane,
+        raw_geometry=False,
+    ):
+        """Dense pinhole RGB rendering through the low-level ops so that a single
+        projection provides both the visibility mask for LazySHAdam's forward and
+        the rasterization inputs (rasterization() would project again). Same
+        kernels as rasterization()."""
+        C, N = viewmats.shape[0], means.shape[0]
+        tile_size = 16
+        if raw_geometry:
+            # means/quats/scales/opacities are the raw parameters; activation,
+            # projection and their backward + Adam are fused (GeometryAdam.project).
+            means, opacities, radii, means2d, depths, conics, tiles_per_gauss = self.geo_adam.project(
+                means, quats, scales, opacities, viewmats, Ks, width, height,
+                eps2d=0.3, near_plane=near_plane, far_plane=far_plane, tile_size=tile_size,
+            )
+        else:
+            radii, means2d, depths, conics, _ = fully_fused_projection(
+                means, None, quats, scales, viewmats, Ks, width, height,
+                eps2d=0.3, near_plane=near_plane, far_plane=far_plane, opacities=opacities,
+            )
+        mask = radii[..., 0] > 0  # culled gaussians have radii (0, 0), visible ones >= 1
+        colors = self.lazy_sh.colors(sh_degree, means, viewmats, mask)  # [C, N, 3]
+        # With one camera a plain view: expand's backward would copy the gradient.
+        opac = opacities[None] if C == 1 else opacities[None].expand(C, N)
+        tile_width = math.ceil(width / float(tile_size))
+        tile_height = math.ceil(height / float(tile_size))
+        if raw_geometry:
+            # first pass (tiles per gaussian) already done in the projection
+            isect_ids, flatten_ids = torch.ops.gsplat.intersect_tile_counted(
+                means2d, radii, depths, conics, opac, tiles_per_gauss, tile_size, tile_width, tile_height
+            )
+        else:
+            _, isect_ids, flatten_ids = isect_tiles(
+                means2d, radii, depths, tile_size, tile_width, tile_height,
+                packed=False, n_images=C, conics=conics, opacities=opac,
+            )
+        isect_offsets = isect_offset_encode(isect_ids, C, tile_width, tile_height)
+        render_colors, render_alphas = rasterize_to_pixels(
+            means2d, conics, colors, opac, width, height, tile_size, isect_offsets, flatten_ids,
+            absgrad=self.cfg.strategy.absgrad if isinstance(self.cfg.strategy, DefaultStrategy) else False,
+        )
+        info = {
+            "means2d": means2d,
+            "radii": radii,
+            "depths": depths,
+            "conics": conics,
+            "width": width,
+            "height": height,
+            "n_cameras": C,
+            "gaussian_ids": None,
+            "tile_width": tile_width,
+            "tile_height": tile_height,
+            "flatten_ids": flatten_ids,
+            "isect_offsets": isect_offsets,
+            "tile_size": tile_size,
+        }
+        return render_colors, render_alphas, info
+
     def rasterize_splats(
         self,
         camtoworlds: Tensor,
@@ -741,12 +824,33 @@ class Runner:
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         splats = splats if splats is not None else self.splats
-        means = splats["means"]  # [N, 3]
-        # quats = F.normalize(splats["quats"], dim=-1)  # [N, 4]
-        # rasterization does normalization internally
-        quats = splats["quats"]  # [N, 4]
-        scales = torch.exp(splats["scales"])  # [N, 3]
-        opacities = torch.sigmoid(splats["opacities"])  # [N,]
+        raw_geometry = (
+            self.cfg.fused_projection_adam
+            and self.geo_adam is not None
+            and splats is self.splats
+            and torch.is_grad_enabled()
+            and camtoworlds.shape[0] == 1
+            and kwargs.get("render_mode", "RGB") == "RGB"
+            and (rasterize_mode or "classic") == "classic"
+            and not hasattr(self, "ncore_camera_data")
+        )
+        if raw_geometry:
+            # Activation + projection happen in _render_lowlevel_lazy.
+            means, quats, scales, opacities = (
+                splats["means"], splats["quats"], splats["scales"], splats["opacities"]
+            )
+        elif self.geo_adam is not None and splats is self.splats:
+            # Activations whose backward applies the geometry Adam steps directly.
+            means, quats, scales, opacities = self.geo_adam.activate(
+                splats["means"], splats["quats"], splats["scales"], splats["opacities"]
+            )
+        else:
+            means = splats["means"]  # [N, 3]
+            # quats = F.normalize(splats["quats"], dim=-1)  # [N, 4]
+            # rasterization does normalization internally
+            quats = splats["quats"]  # [N, 4]
+            scales = torch.exp(splats["scales"])  # [N, 3]
+            opacities = torch.sigmoid(splats["opacities"])  # [N,]
 
         image_ids = kwargs.pop("image_ids", None)
         if self.cfg.app_opt:
@@ -762,19 +866,24 @@ class Runner:
             sh_degree = kwargs.pop("sh_degree", self.cfg.sh_degree)
             viewmats = torch.linalg.inv_ex(camtoworlds).inverse
             if self.lazy_sh is not None:
-                mask = None
-                if torch.is_grad_enabled():
-                    # Gaussians this step rasterizes (same projection as below);
-                    # only their SH rows need to be current in the forward.
-                    with torch.no_grad():
-                        radii = fully_fused_projection(
-                            means, None, quats, scales, viewmats, Ks, width, height,
-                            near_plane=kwargs.get("near_plane", 0.01),
-                            far_plane=kwargs.get("far_plane", 1e10),
-                            opacities=opacities,
-                        )[0]
-                        mask = (radii > 0).all(dim=-1)  # [C, N]
-                colors = self.lazy_sh.colors(sh_degree, means, viewmats, mask)  # [C, N, 3]
+                lazy_lowlevel = (
+                    torch.is_grad_enabled()
+                    and kwargs.get("render_mode", "RGB") == "RGB"
+                    and (rasterize_mode or "classic") == "classic"
+                    and not self.cfg.antialiased
+                    and not hasattr(self, "ncore_camera_data")
+                )
+                if lazy_lowlevel:
+                    # Project once; the visibility mask both limits the lazy SH
+                    # forward and feeds the rest of the rendering below.
+                    render_colors, render_alphas, info = self._render_lowlevel_lazy(
+                        means, quats, scales, opacities, viewmats, Ks, width, height,
+                        sh_degree, kwargs.get("near_plane", 0.01), kwargs.get("far_plane", 1e10),
+                        raw_geometry=raw_geometry,
+                    )
+                    colors = None
+                else:
+                    colors = self.lazy_sh.colors(sh_degree, means, viewmats, None)  # [C, N, 3]
             elif self.cfg.fused_sh_colors:
                 colors = sh_colors_fused_adam(
                     sh_degree,
@@ -838,34 +947,35 @@ class Runner:
                     .unsqueeze(0)
                 )
 
-        render_colors, render_alphas, info = rasterization(
-            means=means,
-            quats=quats,
-            scales=scales,
-            opacities=opacities,
-            colors=colors,
-            viewmats=torch.linalg.inv_ex(camtoworlds).inverse,  # [C, 4, 4]
-            Ks=Ks,  # [C, 3, 3]
-            width=width,
-            height=height,
-            packed=self.cfg.packed,
-            absgrad=(
-                self.cfg.strategy.absgrad
-                if isinstance(self.cfg.strategy, DefaultStrategy)
-                else False
-            ),
-            sparse_grad=self.cfg.sparse_grad,
-            rasterize_mode=rasterize_mode,
-            distributed=self.world_size > 1,
-            camera_model=camera_model,
-            with_ut=with_ut,
-            with_eval3d=self.cfg.with_eval3d,
-            ftheta_coeffs=ftheta_coeffs,
-            radial_coeffs=radial_coeffs,
-            tangential_coeffs=tangential_coeffs,
-            thin_prism_coeffs=thin_prism_coeffs,
-            **kwargs,
-        )
+        if colors is not None:
+            render_colors, render_alphas, info = rasterization(
+                means=means,
+                quats=quats,
+                scales=scales,
+                opacities=opacities,
+                colors=colors,
+                viewmats=torch.linalg.inv_ex(camtoworlds).inverse,  # [C, 4, 4]
+                Ks=Ks,  # [C, 3, 3]
+                width=width,
+                height=height,
+                packed=self.cfg.packed,
+                absgrad=(
+                    self.cfg.strategy.absgrad
+                    if isinstance(self.cfg.strategy, DefaultStrategy)
+                    else False
+                ),
+                sparse_grad=self.cfg.sparse_grad,
+                rasterize_mode=rasterize_mode,
+                distributed=self.world_size > 1,
+                camera_model=camera_model,
+                with_ut=with_ut,
+                with_eval3d=self.cfg.with_eval3d,
+                ftheta_coeffs=ftheta_coeffs,
+                radial_coeffs=radial_coeffs,
+                tangential_coeffs=tangential_coeffs,
+                thin_prism_coeffs=thin_prism_coeffs,
+                **kwargs,
+            )
         if masks is not None:
             render_colors[~masks] = 0
 
