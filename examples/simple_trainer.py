@@ -143,6 +143,9 @@ class Config:
     # memory, instead of decoding one image per step (COLMAP data only). Costs
     # the decoded training set in host memory on every rank.
     cache_images: bool = False
+    # DataLoader worker processes decoding training images. Early in training
+    # (few Gaussians) 4 workers cap a garden/4 run at ~130 steps/s.
+    num_workers: int = 4
     # Steps to evaluate the model
     eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Steps to save the model
@@ -380,6 +383,38 @@ def create_splats_with_optimizers(
         for name, _, lr in params
     }
     return splats, optimizers
+
+
+class _DeviceCachedLoader:
+    """Iterates shuffled batches over dataset items that are all kept on
+    `device`, in exactly the order DataLoader(shuffle=True, drop_last=False,
+    persistent_workers=True) would produce from the same global RNG state."""
+
+    def __init__(self, dataset, batch_size: int, device):
+        items = [dataset[i] for i in range(len(dataset))]
+        self.n = len(items)
+        self.batch_size = batch_size
+        self.data = {
+            k: [torch.as_tensor(item[k]).to(device) for item in items] for k in items[0]
+        }
+        self._started = False
+
+    def __iter__(self):
+        if not self._started:
+            # The DataLoader iterator draws its worker base seed once.
+            torch.empty((), dtype=torch.int64).random_()
+            self._started = True
+        # RandomSampler: per-epoch seed from the global RNG, then randperm.
+        seed = int(torch.empty((), dtype=torch.int64).random_().item())
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        order = torch.randperm(self.n, generator=generator).tolist()
+        for i in range(0, self.n, self.batch_size):
+            idx = order[i : i + self.batch_size]
+            if len(idx) == 1:
+                yield {k: v[idx[0]].unsqueeze(0) for k, v in self.data.items()}
+            else:
+                yield {k: torch.stack([v[j] for j in idx]) for k, v in self.data.items()}
 
 
 class Runner:
@@ -853,14 +888,21 @@ class Runner:
         if cfg.cache_images:
             # before the loader starts its workers, which then share the cache
             self.trainset.preload_images()
-        trainloader = torch.utils.data.DataLoader(
-            self.trainset,
-            batch_size=cfg.batch_size,
-            shuffle=True,
-            num_workers=4,
-            persistent_workers=True,
-            pin_memory=True,
-        )
+        if cfg.cache_images and cfg.num_workers == 0 and cfg.patch_size is None:
+            # Keep the decoded training set on the GPU: no worker processes, no
+            # per-step IPC / pinning (which also contend for the GIL with the
+            # training loop) and no host-to-device copies. Random crops must
+            # use the DataLoader so each visit samples a new patch.
+            trainloader = _DeviceCachedLoader(self.trainset, cfg.batch_size, device)
+        else:
+            trainloader = torch.utils.data.DataLoader(
+                self.trainset,
+                batch_size=cfg.batch_size,
+                shuffle=True,
+                num_workers=cfg.num_workers,
+                persistent_workers=cfg.num_workers > 0,
+                pin_memory=True,
+            )
         trainloader_iter = iter(trainloader)
 
         # Training loop.
